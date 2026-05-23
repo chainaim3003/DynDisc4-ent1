@@ -95,6 +95,12 @@ import {
 import { getNotifier, type AgentEvent } from "../../notify/index.js";
 import { attachNotificationsToAudit } from "../../notify/audit-attach.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 1 imports.
+// Per-deal folder + legacy-fallback reads via shared/audit-paths.ts.
+// ============================================================================
+import { getDealFolder, getLegacyEscalationsDir } from "../../shared/audit-paths.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
@@ -195,6 +201,37 @@ class BuyerAgentExecutor implements AgentExecutor {
   /** Iteration 4: resolve the sellerMin used in outcomeQualityInputs (disclosed > fallback). */
   private resolveSellerMin(negotiationId: string): number {
     return this.disclosedBySeller.get(negotiationId)?.value ?? 350;
+  }
+
+  // ===========================================================================
+  // Audit Framework v6 — Iteration 1 (Phase 3c):
+  // At deal close, fetch the seller's RESOLVED live mode from its
+  // /api/self/mode-status endpoint (port 8080, added in CONT8 / M2-ε) and
+  // embed it under the audit's `sellerResponseMode` block. This replaces the
+  // misnamed pre-v6 block that actually contained the LOCAL agent's env
+  // resolution (now renamed to `selfProcessMode` in logger.ts).
+  //
+  // Failures DO NOT throw — they return `{ error: "<message>" }` so the audit
+  // JSON carries a visible failure marker rather than a silent null. 3-second
+  // hard timeout via AbortController so a hung seller cannot stall deal close.
+  // ===========================================================================
+  private async fetchSellerLiveMode(): Promise<Record<string, unknown> | null> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const resp = await fetch("http://localhost:8080/api/self/mode-status", {
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!resp.ok) {
+        return { error: `seller mode-status HTTP ${resp.status}` };
+      }
+      const body = await resp.json() as Record<string, unknown>;
+      return body;
+    } catch (err: any) {
+      clearTimeout(timer);
+      return { error: err?.message ?? String(err) };
+    }
   }
 
   async cancelTask(taskId: string): Promise<void> {
@@ -450,6 +487,42 @@ class BuyerAgentExecutor implements AgentExecutor {
       buyerAction: "OFFER", timestamp: new Date().toISOString() });
 
     await this.sendToSeller(offerData, contextId);
+
+    // ========================================================================
+    // Audit Framework v6 — Iteration 1 / Bug 2 fix:
+    // Seed the decision trail with a round-1 entry for the opening offer so
+    // the audit JSON's decisions[] is non-empty even for deals that escalate
+    // before makeNegotiationDecision() runs (which only runs in response to a
+    // seller counter). Without this seed, escalation deals had decisions=[],
+    // which the v6 audit framework T5 acceptance test fails on.
+    //
+    // marketContext is left undefined here on purpose — fetching a market
+    // snapshot at agent cold-start would add ~1s to the first-offer latency,
+    // and the opening offer is generated without reference to live market data
+    // anyway (it's either the user-specified price or a random value in
+    // BUYER_CONFIG.initialOfferRange).
+    // ========================================================================
+    const openingEntry: DecisionTrailEntry = {
+      round:         state.currentRound,
+      timestamp:     new Date().toISOString(),
+      perspective:   "BUYER",
+      incomingOffer: undefined,
+      llmProposal: {
+        action:       "OFFER",
+        price:        initialOffer,
+        reasoning:    userPrice
+                        ? "Opening at user-specified price"
+                        : "Random opening offer with negotiation headroom",
+        usedFallback: false,
+      },
+      finalDecision: {
+        action: "OFFER",
+        price:  initialOffer,
+      },
+      marketContext: undefined,
+    };
+    this.decisionTrail.set(negotiationId, [openingEntry]);
+
     // Iter-4.3: embed "Round 1" in the text so the UI parser extracts the
     // round directly instead of trying to infer it from arrival order. With
     // two independent SSE channels (buyer :9090, seller :8080), inferring
@@ -568,8 +641,12 @@ class BuyerAgentExecutor implements AgentExecutor {
     const sellerMetaEsc = readAgentCardMetadata("jupiterSellerAgent");
     const buyerMetaEsc  = readAgentCardMetadata("tommyBuyerAgent");
     const sellerMinEsc  = this.resolveSellerMin(state.negotiationId);
+    // v6 Iter1 / Phase 3c: fetch seller's live mode for the audit's
+    // sellerResponseMode block (3 s timeout; failure stored as { error }).
+    const sellerLiveMode = await this.fetchSellerLiveMode();
     const auditPathEsc  = logger.saveAuditJson({
       outcome:         "escalation",
+      sellerLiveMode,
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
       quantity:        state.targetQuantity,
       deliveryDate:    state.deliveryDate,
@@ -697,8 +774,12 @@ class BuyerAgentExecutor implements AgentExecutor {
     const sellerMetaForAudit = readAgentCardMetadata("jupiterSellerAgent");
     const buyerMetaForAudit  = readAgentCardMetadata("tommyBuyerAgent");
     const sellerMinForAudit  = this.resolveSellerMin(state.negotiationId);
+    // v6 Iter1 / Phase 3c: fetch seller's live mode for the audit's
+    // sellerResponseMode block (3 s timeout; failure stored as { error }).
+    const sellerLiveModeForAudit = await this.fetchSellerLiveMode();
     const auditPath = logger.saveAuditJson({
       outcome:         "success",
+      sellerLiveMode:  sellerLiveModeForAudit,
       finalPrice:      data.acceptedPrice,
       quantity:        state.targetQuantity,
       deliveryDate:    state.deliveryDate,
@@ -819,8 +900,12 @@ class BuyerAgentExecutor implements AgentExecutor {
       const sellerMetaForAudit2 = readAgentCardMetadata("jupiterSellerAgent");
       const buyerMetaForAudit2  = readAgentCardMetadata("tommyBuyerAgent");
       const sellerMinForAudit2  = this.resolveSellerMin(state.negotiationId);
+      // v6 Iter1 / Phase 3c: fetch seller's live mode for the audit's
+      // sellerResponseMode block (3 s timeout; failure stored as { error }).
+      const sellerLiveModeForAudit2 = await this.fetchSellerLiveMode();
       const auditPath2 = logger.saveAuditJson({
         outcome:         "success",
+        sellerLiveMode:  sellerLiveModeForAudit2,
         finalPrice:      data.pricePerUnit,
         quantity:        state.targetQuantity,
         deliveryDate:    state.deliveryDate,
@@ -1083,10 +1168,14 @@ class BuyerAgentExecutor implements AgentExecutor {
     if (state) state.status = "ESCALATED";
 
     // ── Write CPO escalation report (.txt) ────────────────────────────────────
-    const escalationsDir = path.resolve(__dirname, "..", "..", "escalations");
-    if (!fs.existsSync(escalationsDir)) fs.mkdirSync(escalationsDir, { recursive: true });
+    // Audit Framework v6 — Iteration 1: per-deal folder via getDealFolder().
+    // Pre-v6: escalationsDir = path.resolve(__dirname, "..", "..", "escalations")
+    //         with defensive mkdir.
+    // v6:     dealFolder = getDealFolder(data.negotiationId) →
+    //         audits/YYYY-MM-DD/NEG-{id}/   (mkdir handled inside helper)
+    const dealFolder = getDealFolder(data.negotiationId);
 
-    const reportFile = path.join(escalationsDir, `${data.negotiationId}_DD_CPO_escalation.txt`);
+    const reportFile = path.join(dealFolder, `${data.negotiationId}_DD_CPO_escalation.txt`);
     const hr = "─".repeat(60);
     const lines: string[] = [];
 
@@ -1243,8 +1332,12 @@ class BuyerAgentExecutor implements AgentExecutor {
     const sellerMetaEsc = readAgentCardMetadata("jupiterSellerAgent");
     const buyerMetaEsc  = readAgentCardMetadata("tommyBuyerAgent");
     const sellerMinEsc  = this.resolveSellerMin(state.negotiationId);
+    // v6 Iter1 / Phase 3c: fetch seller's live mode for the audit's
+    // sellerResponseMode block (3 s timeout; failure stored as { error }).
+    const sellerLiveModeEsc = await this.fetchSellerLiveMode();
     const auditPathEsc  = logger.saveAuditJson({
       outcome:         "escalation",
+      sellerLiveMode:  sellerLiveModeEsc,
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
       quantity:        state.targetQuantity,
       deliveryDate:    state.deliveryDate,
@@ -1693,9 +1786,20 @@ app.get('/api/notify-status', (_req, res) => {
 //                                              DEEP-EXT verification script
 //                                     UI gates negotiation on success of this.
 //
-// Both audit endpoints read from src/escalations/*.audit.json which is written
-// by NegotiationLogger.saveAuditJson() on every deal-close and escalation.
-const escalationsDir = path.resolve(__dirname, "..", "..", "escalations");
+// Pre-v6 the buyer's /api/recent-deals, /api/baseline (freshness) and
+// /api/quality endpoints all read from src/escalations/*.audit.json directly.
+// Audit Framework v6 (Iteration 1) splits storage into:
+//   - audits/_legacy_escalations/   ← the pre-v6 files moved here verbatim
+//   - audits/YYYY-MM-DD/NEG-{id}/   ← new deals (one folder per negotiation)
+//
+// This module-scope constant now points at the legacy folder only. It is the
+// reader for /api/recent-deals (which scans by suffix `_BUYER.audit.json`)
+// and the freshness signal for /api/baseline's _meta.stale flag. The
+// /api/quality and /api/quality/:id/pdf endpoints below explicitly check the
+// NEW per-deal layout FIRST, then fall back to this legacy dir for historical
+// deals. Walking the date-partitioned tree to surface new deals in
+// /api/recent-deals is deferred to a later iteration.
+const escalationsDir = getLegacyEscalationsDir();
 
 // ── Mode endpoint ───────────────────────────────────────────────────────────
 app.get('/api/identity-mode', (_req, res) => {
@@ -1976,7 +2080,15 @@ app.get('/api/quality/:negotiationId/pdf', async (req, res) => {
     return void res.status(400).json({ error: "Invalid negotiationId format" });
   }
   try {
+    // Audit Framework v6 — Iteration 1: prefer NEW per-deal layout, fall back
+    // to legacy escalations folder for pre-v6 deals.
+    //   NEW:    audits/YYYY-MM-DD/NEG-{id}/buyer.audit.json
+    //   LEGACY: audits/_legacy_escalations/NEG-{id}_{outcome}_BUYER.audit.json
+    // Note: getDealFolder() recursive-mkdirs the new path even when only
+    // probing; this is acceptable for iter 1 and will be revisited if empty
+    // probe-folders become noisy.
     const candidates = [
+      path.join(getDealFolder(negotiationId), "buyer.audit.json"),
       path.join(escalationsDir, `${negotiationId}_success_BUYER.audit.json`),
       path.join(escalationsDir, `${negotiationId}_escalation_BUYER.audit.json`),
     ];
@@ -1988,9 +2100,11 @@ app.get('/api/quality/:negotiationId/pdf', async (req, res) => {
       return void res.status(404).json({ error: `No audit JSON for ${negotiationId}` });
     }
     const audit = JSON.parse(fs.readFileSync(auditPath, "utf8"));
-    // Try to enrich with seller perspective if available (richer treasury info)
+    // Try to enrich with seller perspective if available (richer treasury info).
+    // Same new-first / legacy-fallback pattern as the buyer lookup above.
     let sellerAudit: any = null;
     for (const fp of [
+      path.join(getDealFolder(negotiationId), "seller.audit.json"),
       path.join(escalationsDir, `${negotiationId}_success_SELLER.audit.json`),
       path.join(escalationsDir, `${negotiationId}_escalation_SELLER.audit.json`),
     ]) {
@@ -2012,7 +2126,10 @@ app.get('/api/quality/:negotiationId', (req, res) => {
     return void res.status(400).json({ error: "Invalid negotiationId format" });
   }
   try {
+    // Audit Framework v6 — Iteration 1: new layout first, legacy fallback.
+    // Same probing pattern as /api/quality/:id/pdf above.
     const candidates = [
+      path.join(getDealFolder(negotiationId), "buyer.audit.json"),
       path.join(escalationsDir, `${negotiationId}_success_BUYER.audit.json`),
       path.join(escalationsDir, `${negotiationId}_escalation_BUYER.audit.json`),
     ];

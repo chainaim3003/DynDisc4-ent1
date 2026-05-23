@@ -6,7 +6,7 @@
 
 import fs   from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
+import { getDealFolder } from "./audit-paths.js";
 import type {
   NegotiationAudit,
   AgentRole,
@@ -19,10 +19,12 @@ import type {
   RoundHistory,
 } from "./negotiation-types.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
-
-const ESCALATIONS_DIR = path.resolve(__dirname, "..", "escalations");
+// ============================================================================
+// Audit Framework v6 — Iteration 1:
+// Per-deal folder layout via shared/audit-paths.ts.
+// Old: ESCALATIONS_DIR = path.resolve(__dirname, '..', 'escalations')
+// New: getDealFolder(state.negotiationId) → audits/YYYY-MM-DD/NEG-{id}/
+// ============================================================================
 
 /**
  * Save a seller-perspective audit JSON file.
@@ -50,7 +52,8 @@ export function saveSellerAuditJSON(
     paymentTerms:       string;
   }
 ): string {
-  if (!fs.existsSync(ESCALATIONS_DIR)) fs.mkdirSync(ESCALATIONS_DIR, { recursive: true });
+  // v6 Iter1: per-deal folder; getDealFolder() also mkdir-recursive's the path.
+  const dealFolder = getDealFolder(state.negotiationId);
 
   const audit: NegotiationAudit = {
     negotiationId: state.negotiationId,
@@ -118,7 +121,7 @@ export function saveSellerAuditJSON(
     marketData: state.marketSnapshot,
   };
 
-  const filePath = path.join(ESCALATIONS_DIR, `${state.negotiationId}_audit_SELLER.json`);
+  const filePath = path.join(dealFolder, `${state.negotiationId}_audit_SELLER.json`);
   fs.writeFileSync(filePath, JSON.stringify(audit, null, 2), "utf8");
   return filePath;
 }
@@ -143,7 +146,8 @@ export function saveBuyerAuditJSON(
     paymentTerms:       string;
   }
 ): string {
-  if (!fs.existsSync(ESCALATIONS_DIR)) fs.mkdirSync(ESCALATIONS_DIR, { recursive: true });
+  // v6 Iter1: per-deal folder; getDealFolder() also mkdir-recursive's the path.
+  const dealFolder = getDealFolder(state.negotiationId);
 
   const audit: NegotiationAudit = {
     negotiationId: state.negotiationId,
@@ -204,7 +208,7 @@ export function saveBuyerAuditJSON(
     marketData: state.marketSnapshot,
   };
 
-  const filePath = path.join(ESCALATIONS_DIR, `${state.negotiationId}_audit_BUYER.json`);
+  const filePath = path.join(dealFolder, `${state.negotiationId}_audit_BUYER.json`);
   fs.writeFileSync(filePath, JSON.stringify(audit, null, 2), "utf8");
   return filePath;
 }
