@@ -132,7 +132,28 @@ iter-1 code locally and pushing to a secret-scanning-enabled remote: re-run
 `Scrub-TwilioSIDs-LegacyAudits.ps1` before commit, or do not commit
 `audits/YYYY-MM-DD/NEG-*/` folders containing such errors.
 
-*(none other yet)*
+### 2026-05-23 — Notes addendum: 5-tier `messageSigningPosture.tier` enum (Iter 2)
+
+Q15 locked `HASH_ENVELOPE` as the 5th tier of `messageSigningPosture.tier`
+without enumerating the other 4 sibling values. Iter 2 needs the closed
+enum to write the new audit block, so the full set is recorded here:
+
+| Tier | Meaning | Wired today? |
+|---|---|---|
+| `NONE` | No envelope — plain payload, no tamper-evidence, no replay protection. Reserved for downgrade scenarios. | No |
+| `HASH_ENVELOPE` | sha256(payload) + monotonic counter + ISO timestamp + sha256(envelope). Tamper-evidence + replay protection. No identity proof. | Yes — `PlainHashSigner` (current default) |
+| `SIGNED_HASH` | `HASH_ENVELOPE` + Ed25519 (or equivalent) signature over the envelope hash. Cryptographic non-repudiation, but signing key not bound to a legal entity. | No — reserved intermediate step |
+| `KERI_SEAL` | A KERI seal anchored in a Key Event Log (KEL) under a self-addressing identifier (SAID). Auditable key history and rotation. | No — reserved for iter-9 / iter-14 (KERI signing track) |
+| `VLEI_BOUND` | `KERI_SEAL` + the signing AID is provably delegated via the GLEIF chain `GLEIF_ROOT → QVI → LE → OOR → agent`. Signature legally binds the represented legal entity. | No — reserved for iter-14 (full vLEI binding) |
+
+Every audit written today emits `"tier": "HASH_ENVELOPE"` because that is
+the honest label for what `PlainHashSigner` produces. The other 4 values
+are reserved vocabulary so future iterations can climb the ladder without
+audit-schema changes.
+
+This addendum does not modify Q15 (locked value remains "add `HASH_ENVELOPE`
+as the 5th tier"); it documents the full set of sibling values that Iter 2
+encodes into the audit JSON schema.
 
 ---
 

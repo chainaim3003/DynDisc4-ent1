@@ -22,6 +22,28 @@ import { getDealFolder, getAuditsRoot } from "./audit-paths.js";
 import { appendAuditIndexLine } from "./index-jsonl-writer.js";
 import type { AuditIndexLine } from "./audit-index-schema.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 2 imports.
+// Identity proof + message-signing posture + per-deal message log.
+// Each block has its own builder under shared/audit-blocks/ or a dedicated
+// collector module under shared/; this file is the single integration point.
+// ============================================================================
+import type { AgentIdentity, VerificationResult } from "../identity/CredentialProvider.js";
+import type { SigningMode } from "../messaging/signed-message.js";
+import {
+    buildIdentityProofBlock,
+    type IdentityProofBlock,
+} from "./audit-blocks/identity-proof.js";
+import {
+    buildMessageSigningPostureBlock,
+    type MessageSigningPostureBlock,
+    type MessageSigningTier,
+} from "./audit-blocks/message-signing-posture.js";
+import {
+    getMessageLogCollector,
+    type MessageLogEntry,
+} from "./message-log-collector.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
@@ -640,6 +662,24 @@ export class NegotiationLogger {
         // Buyer-side only; seller writes its own selfProcessMode block which
         // IS the seller's live mode — no fetch needed on seller side.
         sellerLiveMode?:      Record<string, unknown> | null;
+        // ====================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 2 inputs.
+        // - ownIdentity: result of CredentialProvider.loadOwnIdentity()
+        //   cached on the agent at startup. Optional for backward compat
+        //   with callers that still pass only ownLEI/ownEntityName; when
+        //   supplied, enables the richer `agent.self` + `identityProof.self`.
+        // - counterpartyVerification: result of
+        //   CredentialProvider.verifyCounterparty(). Same backward-compat note.
+        // - signingMode / signerProvider: from getMessageSigner(). Drives
+        //   the honest tier label in messageSigningPosture.
+        // - signingTierOverride: rarely needed; reserved for future signers
+        //   that don't map cleanly through defaultTierForMode().
+        // ====================================================================
+        ownIdentity?:              AgentIdentity;
+        counterpartyVerification?: VerificationResult;
+        signingMode?:              SigningMode;
+        signerProvider?:           string;
+        signingTierOverride?:      MessageSigningTier;
     }): string {
         // v6 Iter1: per-deal folder; mkdir handled inside getDealFolder().
         const dir = getDealFolder(this.negotiationId);
@@ -659,6 +699,56 @@ export class NegotiationLogger {
         const outcomeQuality = params.outcomeQualityInputs
             ? computeOutcomeQuality(params.outcomeQualityInputs)
             : undefined;
+
+        // ================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 2: build the new audit blocks.
+        // identityProof requires both own + counterparty data; falls back
+        // to undefined when either is missing (backward compat with caller
+        // paths still using the LEI-only iter-1 params).
+        // ================================================================
+        const collector = getMessageLogCollector();
+        const messageLog: MessageLogEntry[] = collector.getLog(this.negotiationId);
+
+        let identityProof: IdentityProofBlock | undefined;
+        if (params.ownIdentity && params.counterpartyVerification) {
+            identityProof = buildIdentityProofBlock(
+                params.ownIdentity,
+                params.counterpartyVerification,
+            );
+        }
+
+        // messageSigningPosture is emitted whenever the signing mode is
+        // known. Stats are derived from the collector's log for this deal.
+        let messageSigningPosture: MessageSigningPostureBlock | undefined;
+        if (params.signingMode) {
+            messageSigningPosture = buildMessageSigningPostureBlock({
+                signingMode:  params.signingMode,
+                provider:     params.signerProvider ?? "unknown",
+                stats:        collector.computeStats(this.negotiationId),
+                tierOverride: params.signingTierOverride,
+            });
+        }
+
+        // agent.self / agent.counterparty extend (not replace) the existing
+        // `parties` block. These are lightweight "who acted" summaries; the
+        // deep snapshot (GLEIF status, KERI chain, etc.) lives in identityProof.
+        const agentSelf = params.ownIdentity ? {
+            role:            this.myRole,
+            agentName:       params.ownIdentity.agentName,
+            legalEntityName: params.ownIdentity.legalEntityName,
+            lei:             params.ownIdentity.lei,
+            oorOfficer:      params.ownIdentity.oorOfficer,
+            agentAID:        params.ownIdentity.agentAID,
+        } : undefined;
+
+        const agentCounterparty = params.counterpartyVerification ? {
+            role:            this.myRole === "BUYER" ? "SELLER" : "BUYER",
+            agentName:       params.counterpartyVerification.counterparty.agentName,
+            legalEntityName: params.counterpartyVerification.counterparty.legalEntityName,
+            lei:             params.counterpartyVerification.counterparty.lei,
+            oorOfficer:      params.counterpartyVerification.counterparty.oorOfficer,
+            agentAID:        params.counterpartyVerification.counterparty.agentAID,
+        } : undefined;
 
         const auditDoc = {
             negotiationId:  this.negotiationId,
@@ -701,6 +791,25 @@ export class NegotiationLogger {
             identity: {
                 credentialMode: params.credentialMode ?? "plain",
             },
+            // ================================================================
+            // AUDIT FRAMEWORK V6 — Iteration 2 audit blocks.
+            // - agent.self / agent.counterparty: lightweight "who acted" pair
+            //   that EXTENDS the existing `parties` block (kept above for
+            //   backward compat).
+            // - identityProof: deep GLEIF + KERI + verification snapshot.
+            //   Mirrors what the GLEIF UI shows for each agent (T1).
+            // - messageSigningPosture: honest tamper-evidence tier (T2),
+            //   with the 5-value enum locked in DECISIONS.md notes addendum.
+            // - messageLog[]: every envelope sent or received this deal,
+            //   each with transportSignature.payloadHash (T3, T4).
+            // ================================================================
+            agent: {
+                self:         agentSelf,
+                counterparty: agentCounterparty,
+            },
+            identityProof,
+            messageSigningPosture,
+            messageLog,
             negotiation: {
                 roundsUsed:      params.roundsUsed,
                 maxRounds:       params.maxRounds,
@@ -720,6 +829,12 @@ export class NegotiationLogger {
         };
 
         fs.writeFileSync(filePath, JSON.stringify(auditDoc, null, 2), "utf8");
+
+        // Iter 2: free the in-memory message log for this negotiation now
+        // that its content is durable on disk inside auditDoc.messageLog[].
+        // Safe even if the collector was never populated for this deal
+        // (clear() is a no-op when the negotiationId is unknown).
+        collector.clear(this.negotiationId);
 
         // ================================================================
         // AUDIT FRAMEWORK V6 — Iteration 1 (Phase 2): append one line to

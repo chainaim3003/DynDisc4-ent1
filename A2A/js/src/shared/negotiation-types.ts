@@ -191,7 +191,12 @@ export interface DecisionTrailEntry {
     perspective:        AgentRole;
     incomingOffer?:     number;            // what the counterparty just offered (undefined for round 1 buyer-side)
     llmProposal: {
-        action:         "ACCEPT" | "COUNTER" | "REJECT";
+        // "OFFER" is used by the round-1 seed entry (buyer-side opening offer)
+        // added in iter-1 / Bug 2 fix; the runtime decision union remains
+        // ACCEPT/COUNTER/REJECT but the seed needs an explicit OFFER label so
+        // decisions[] is never empty even for deals that escalate before
+        // makeNegotiationDecision() runs.
+        action:         "OFFER" | "ACCEPT" | "COUNTER" | "REJECT";
         price?:         number;
         reasoning:      string;
         usedFallback?:  boolean;            // true if rule-based fallback was used
@@ -209,7 +214,8 @@ export interface DecisionTrailEntry {
         netProfit?:     number;
     };
     finalDecision: {
-        action:         "ACCEPT" | "COUNTER" | "REJECT";
+        // Includes "OFFER" for the iter-1 round-1 seed entry (see llmProposal note above).
+        action:         "OFFER" | "ACCEPT" | "COUNTER" | "REJECT";
         price?:         number;
     };
     marketContext?: {
