@@ -82,7 +82,57 @@ For audit trail purposes, the pre-flight state captured at start of Iteration 1:
 
 ## Notes (append-only)
 
-*(none yet)*
+### 2026-05-23 — Erratum E5: Twilio Account SIDs scrubbed from iter-1 branch (bulk + targeted)
+
+The first acceptance-test deal (`NEG-1779521359763`, run during T2 verification) wrote
+the Twilio Account SID into its `notifications[].error` field via WhatsApp delivery
+failures (Twilio quota-exceeded error 63038). When the iter-1 branch was pushed to
+origin, GitHub Push Protection rejected the push at 5 occurrences in that file.
+
+**On second push attempt, the scanner then flagged the same SID in a LEGACY audit
+file (`NEG-1779294300774_escalation_BUYER.audit.json`), revealing that the SID was
+pre-existing in the 494 historical files migrated from `escalations/` into
+`_legacy_escalations/` by Iteration 1.** The same Twilio account had been used
+throughout the project, so most historical deals that experienced a Twilio quota
+error embedded the same account SID into their audit JSON. Selectively scrubbing
+file-by-file would have been whack-a-mole; a bulk scrub was required.
+
+**Action taken (2026-05-23):**
+- The entire `audits/2026-05-23/NEG-1779521359763/` folder was deleted from the
+  iter-1 branch via history rewrite (soft reset + recommit). This was the test
+  deal; no historical value.
+- The 2 corresponding lines were removed from `audits/index.jsonl`.
+- A bulk-scrub script (`Scrub-TwilioSIDs-LegacyAudits.ps1`) was written to walk
+  every `*.audit.json`, `*.json`, and `*.txt` under `A2A/js/src/audits/` and
+  replace every match of `(?-i)AC[0-9a-f]{32}` with the literal
+  `AC_REDACTED_LEGACY`. Script result on first run: **502 files scanned, 112
+  modified, 1680 SID occurrences replaced**. Second run: 0 modifications,
+  confirming idempotency. Cross-check pass: zero SIDs remain anywhere under
+  `audits/`.
+- Original (un-redacted) audit data is preserved in the source-of-truth backup
+  at `C:\SATHYA\backups\DynDisc4\escalations-pre-iter1-2026-05-23`. If the
+  original SID is ever needed for forensics, restore from backup.
+- Acceptance tests T1–T7 had already passed against `NEG-1779521359763`; they were
+  re-validated against `NEG-1779524748883` (a later test deal). Test-AuditV6-Iter1.ps1
+  was re-run after the scrub: expected to remain 34/34 PASS, 0 FAIL (the scrub
+  only modifies `notifications[].error` string content; structural keys and
+  shape are unaffected).
+- No production data was affected.
+
+**Root cause:** Iteration 1's audit-writer changes did not include a redactor for
+upstream provider error strings. Any audit JSON containing a Twilio quota error
+embeds the account SID via the raw error message.
+
+**Deferred to a later iteration (NOT iter 2):** add a redactor in
+`logger.ts` (or wherever `notifications[].error` is captured) that scrubs
+`AC[a-f0-9]{32}` and similar provider-identifying patterns before writing to
+disk. Until that ships, every new audit that includes a Twilio failure will
+reintroduce the same secret-scanner trigger. Workaround for users running
+iter-1 code locally and pushing to a secret-scanning-enabled remote: re-run
+`Scrub-TwilioSIDs-LegacyAudits.ps1` before commit, or do not commit
+`audits/YYYY-MM-DD/NEG-*/` folders containing such errors.
+
+*(none other yet)*
 
 ---
 

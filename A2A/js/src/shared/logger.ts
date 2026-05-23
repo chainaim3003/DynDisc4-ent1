@@ -13,6 +13,15 @@ import { computeOutcomeQuality, OutcomeQuality, QualityInputs } from "./outcome-
 // dotenv-loaded vars.
 import { buildSellerResponseModeBlock } from "./negotiation-mode.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 1 imports.
+// All audit-related file paths now flow through shared/audit-paths.ts.
+// Index.jsonl appending happens after each saveAuditJson write.
+// ============================================================================
+import { getDealFolder, getAuditsRoot } from "./audit-paths.js";
+import { appendAuditIndexLine } from "./index-jsonl-writer.js";
+import type { AuditIndexLine } from "./audit-index-schema.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
@@ -334,11 +343,8 @@ export class NegotiationLogger {
         deliveryDate:     string;
         logs:             NegotiationLog[];
     }): string {
-        // Ensure escalations directory exists next to this file (src/escalations/)
-        const escalationsDir = path.resolve(__dirname, "..", "escalations");
-        if (!fs.existsSync(escalationsDir)) {
-            fs.mkdirSync(escalationsDir, { recursive: true });
-        }
+        // v6 Iter1: per-deal folder; mkdir handled inside getDealFolder().
+        const escalationsDir = getDealFolder(this.negotiationId);
 
         const filePath = path.join(escalationsDir, `${this.negotiationId}_escalation_${this.myRole}.txt`);
         const now      = new Date();
@@ -448,10 +454,8 @@ export class NegotiationLogger {
             workingCapitalCost?:  number;
         };
     }): string {
-        const reportsDir = path.resolve(__dirname, "..", "escalations");
-        if (!fs.existsSync(reportsDir)) {
-            fs.mkdirSync(reportsDir, { recursive: true });
-        }
+        // v6 Iter1: per-deal folder; mkdir handled inside getDealFolder().
+        const reportsDir = getDealFolder(this.negotiationId);
 
         const filePath = path.join(reportsDir, `${this.negotiationId}_success_${this.myRole}.txt`);
         const now      = new Date();
@@ -626,12 +630,29 @@ export class NegotiationLogger {
         // ITERATION 4 — decision trail and constraint disclosure
         decisions?:           Record<string, unknown>[];   // DecisionTrailEntry[]
         constraintDisclosure?: Record<string, unknown>;     // ConstraintDisclosureRecord
+        // AUDIT FRAMEWORK V6 — Iteration 1 (Phase 3c):
+        // Seller's live mode block, fetched by the BUYER from the seller's
+        // /api/self/mode-status endpoint at deal close. Embedded under the new
+        // top-level `sellerResponseMode` key. The pre-v6 key with the same name
+        // (now renamed to `selfProcessMode`) was misnamed: it actually contained
+        // the agent's own self-resolved mode, not the seller's mode.
+        // See AUDIT-FRAMEWORK-V6-DECISIONS.md errata E2 + CONT8 Finding #1.
+        // Buyer-side only; seller writes its own selfProcessMode block which
+        // IS the seller's live mode — no fetch needed on seller side.
+        sellerLiveMode?:      Record<string, unknown> | null;
     }): string {
-        const dir = path.resolve(__dirname, "..", "escalations");
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        // v6 Iter1: per-deal folder; mkdir handled inside getDealFolder().
+        const dir = getDealFolder(this.negotiationId);
+        // v6 Iter1 / T2: new filename pattern — role-only, outcome lives in JSON.
+        //   audits/YYYY-MM-DD/NEG-{id}/buyer.audit.json
+        //   audits/YYYY-MM-DD/NEG-{id}/seller.audit.json
+        // The pre-v6 pattern `${negotiationId}_${outcome}_${role}.audit.json`
+        // is preserved verbatim in audits/_legacy_escalations/ for all historical
+        // deals; the buyer-agent UI endpoints fall back to that legacy folder
+        // when a deal isn't found at the new path.
         const filePath = path.join(
             dir,
-            `${this.negotiationId}_${params.outcome}_${this.myRole}.audit.json`,
+            `${this.myRole.toLowerCase()}.audit.json`,
         );
 
         const trail = this.buildTrailFromLogs(params.logs);
@@ -645,11 +666,26 @@ export class NegotiationLogger {
             outcome:        params.outcome,
             startedAt:      this.startTime.toISOString(),
             generatedAt:    new Date().toISOString(),
-            // WEDGE1 / M1: record the seller-response-mode state at deal-close
-            // so every audit unambiguously declares which mode+providerModes+
-            // evaluationContext produced it. Lazy env read; safe to call here
-            // because dotenv has already loaded by the time any deal closes.
-            sellerResponseMode: buildSellerResponseModeBlock(),
+            // ================================================================
+            // AUDIT FRAMEWORK V6 — Iteration 1 (Phase 3c) renames and additions
+            // ----------------------------------------------------------------
+            // BEFORE v6: there was a single `sellerResponseMode` block here,
+            // populated from buildSellerResponseModeBlock(). That block was
+            // MISNAMED — it actually contained the LOCAL agent's resolution
+            // of the env vars, not the seller's mode (see CONT8 Finding #1).
+            //
+            // AFTER v6: two blocks.
+            //   - `selfProcessMode`     = THIS agent's own resolution
+            //                             (what was previously named sellerResponseMode)
+            //   - `sellerResponseMode`  = the seller's actual live mode.
+            //                             Buyer fetches /api/self/mode-status
+            //                             on the seller and passes it as
+            //                             params.sellerLiveMode. Seller-side
+            //                             leaves this null (the seller's own
+            //                             selfProcessMode IS the seller mode).
+            // ================================================================
+            selfProcessMode:    buildSellerResponseModeBlock(),
+            sellerResponseMode: params.sellerLiveMode ?? null,
             parties: {
                 self: {
                     role:            this.myRole,
@@ -684,6 +720,60 @@ export class NegotiationLogger {
         };
 
         fs.writeFileSync(filePath, JSON.stringify(auditDoc, null, 2), "utf8");
+
+        // ================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 1 (Phase 2): append one line to
+        // audits/index.jsonl per audit write. T3 expects exactly two new
+        // lines per closed deal (buyer + seller perspective).
+        // ================================================================
+        try {
+            const oq: any = outcomeQuality;
+            const treasuryAny: any = params.treasury;
+            const sellerLive: any = params.sellerLiveMode;
+            const selfMode: any = (auditDoc as any).selfProcessMode;
+            const totalDealValue =
+                params.finalPrice !== undefined && params.outcome === "success"
+                    ? params.finalPrice * params.quantity
+                    : null;
+            const indexLine: AuditIndexLine = {
+                schemaVersion:          1,
+                negotiationId:          this.negotiationId,
+                perspective:            this.myRole,
+                auditFile:              path.relative(getAuditsRoot(), filePath).replace(/\\/g, "/"),
+                startedAt:              this.startTime.toISOString(),
+                generatedAt:            (auditDoc as any).generatedAt,
+                outcome:                params.outcome,
+                finalPrice:             params.finalPrice ?? null,
+                quantity:               params.quantity,
+                totalDealValue,
+                currency:               (oq?.currency ?? params.outcomeQualityInputs?.currency ?? "INR"),
+                roundsUsed:             params.roundsUsed,
+                maxRounds:              params.maxRounds,
+                selfLei:                params.ownLEI,
+                selfEntityName:         params.ownEntityName,
+                counterpartyLei:        params.counterpartyLEI,
+                counterpartyEntityName: params.counterpartyEntityName,
+                credentialMode:         params.credentialMode ?? "plain",
+                selfProcessMode:        selfMode?.mode,
+                sellerLiveMode:         this.myRole === "BUYER"
+                                            ? (sellerLive?.mode ?? null)
+                                            : null,
+                closed:                 oq?.closed ?? (params.outcome === "success"),
+                buyerMax:               oq?.buyerMax  ?? null,
+                sellerMin:              oq?.sellerMin ?? null,
+                zopaFeasible:           oq?.ZOPA?.wasFeasible,
+                outsideZopa:            oq?.flags?.outsideZOPA,
+                decisionCount:          params.decisions?.length ?? 0,
+                treasuryOverrideApplied: treasuryAny?.overrideApplied,
+                treasuryFinalNPV:       treasuryAny?.npvOfDeal,
+            };
+            appendAuditIndexLine(indexLine);
+        } catch (err: any) {
+            // Audit JSON is already on disk; index failure is non-fatal.
+            // eslint-disable-next-line no-console
+            console.error(`[audit-index] line construction failed for ${this.negotiationId}: ${err?.message ?? err}`);
+        }
+
         return filePath;
     }
 

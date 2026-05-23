@@ -1,7 +1,7 @@
 # Audit Framework v6 — Iteration Implementation Plan
 
 **Project:** DynDisc4-ent1 — Agentic Procurement
-**Codebase:** `C:\SATHYA\CHAINAIM3003\mcp-servers\FINAGENTS\FINAGENTS4\DynDisc4-ent1`
+**Codebase:** `C:\SATHYA\CHAINAIM3003\mcp-servers\FINAGENTS\FINAGENTS1\DynDisc4-ent1`
 **Design source:** `AUDIT-FRAMEWORK-V6-DESIGN.md` (v6, sealed)
 **Plan created:** 2026-05-22
 **Status:** Approved for execution after pre-flight verification
