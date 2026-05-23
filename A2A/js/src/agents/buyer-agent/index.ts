@@ -62,6 +62,20 @@ import {
 import { getMessageSigner } from "../../messaging/index.js";
 import type { SealedMessage } from "../../messaging/index.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 2 imports.
+// CredentialProvider produces the rich AgentIdentity + VerificationResult
+// objects that feed the new `identityProof` audit block (parallel call to
+// the existing vlei-verification-client; gating logic stays on the vlei-
+// verification-client check above). MessageLogCollector records every
+// signer.seal()/verify() into the per-deal in-memory log read at deal
+// close by logger.saveAuditJson.
+// ============================================================================
+import { getCredentialProvider } from "../../identity/index.js";
+import type { AgentIdentity, VerificationResult } from "../../identity/CredentialProvider.js";
+import { getMessageLogCollector } from "../../shared/message-log-collector.js";
+import type { SigningMode } from "../../messaging/signed-message.js";
+
 // WEDGE1 / Guarantee A — dual-parser for 'start negotiation' commands.
 // Pure function, no side effects. Legacy bare-number form stays byte-identical
 // (verified by scripts/test-cli-parser.ts). Flagged multi-dimensional form is
@@ -130,6 +144,16 @@ class BuyerAgentExecutor implements AgentExecutor {
   private negotiations = new Map<string, BuyerNegotiationState>();
   private loggers      = new Map<string, NegotiationLogger>();
   private llmClient:     LLMNegotiationClient;
+
+  // Audit Framework v6 — Iteration 2: identity + per-negotiation verification cache.
+  // - ownIdentity is loaded once via CredentialProvider.loadOwnIdentity() on
+  //   the first negotiation and reused thereafter (process-stable).
+  // - cpVerifications stores CredentialProvider.verifyCounterparty() output
+  //   per negotiationId so saveAuditJson can build identityProof at deal close.
+  // Both are best-effort: if the provider call fails, the audit simply omits
+  // the identityProof block (logger.ts handles undefined gracefully).
+  private ownIdentity?:    AgentIdentity;
+  private cpVerifications = new Map<string, VerificationResult>();
 
   // Iteration 4: per-negotiation decision trail + counterparty disclosure.
   // decisionTrail   — one entry per LLM/constraint pass, written to audit JSON
@@ -234,6 +258,42 @@ class BuyerAgentExecutor implements AgentExecutor {
     }
   }
 
+  // ===========================================================================
+  // Audit Framework v6 — Iteration 2 helpers.
+  // - ensureOwnIdentity: lazy-load buyer's own identity via CredentialProvider
+  //   on first call; cache for the agent's lifetime.
+  // - buildIter2AuditParams: produces the bundle of iter-2 fields each
+  //   saveAuditJson call needs (ownIdentity, counterpartyVerification,
+  //   signingMode, signerProvider). Spread into saveAuditJson opts at every
+  //   call site so iter-2 only adds one line per audit save.
+  // ===========================================================================
+  private async ensureOwnIdentity(): Promise<AgentIdentity | undefined> {
+    if (this.ownIdentity) return this.ownIdentity;
+    try {
+      const provider = getCredentialProvider();
+      this.ownIdentity = await provider.loadOwnIdentity("buyer", "tommyBuyerAgent");
+      return this.ownIdentity;
+    } catch (err: any) {
+      logInternal(`[identity] iter-2 loadOwnIdentity failed: ${err?.message ?? err} (audit's identityProof.self will be omitted)`);
+      return undefined;
+    }
+  }
+
+  private buildIter2AuditParams(negotiationId: string): {
+    ownIdentity?:              AgentIdentity;
+    counterpartyVerification?: VerificationResult;
+    signingMode?:              SigningMode;
+    signerProvider?:           string;
+  } {
+    const signer = getMessageSigner();
+    return {
+      ownIdentity:              this.ownIdentity,
+      counterpartyVerification: this.cpVerifications.get(negotiationId),
+      signingMode:              signer.mode(),
+      signerProvider:           (signer as any)?.constructor?.name ?? "unknown",
+    };
+  }
+
   async cancelTask(taskId: string): Promise<void> {
     logInternal(`Task cancellation requested: ${taskId}`);
   }
@@ -316,6 +376,21 @@ class BuyerAgentExecutor implements AgentExecutor {
         const sealed = rawData as SealedMessage<NegotiationData>;
         const signer = getMessageSigner();
         const result = signer.verify(sealed, "tommyBuyerAgent");
+
+        // Iter 2: record inbound envelope (success OR failure) so the per-deal
+        // messageLog[] count matches the terminal envelope count (T3) and
+        // every entry carries transportSignature.payloadHash (T4).
+        const inboundPayloadAny = sealed.payload as any;
+        if (inboundPayloadAny?.negotiationId && inboundPayloadAny?.type) {
+          getMessageLogCollector().recordReceive({
+            negotiationId: inboundPayloadAny.negotiationId,
+            sealed,
+            verification:  result,
+            payloadKind:   inboundPayloadAny.type,
+            round:         inboundPayloadAny.round,
+          });
+        }
+
         if (!result.valid) {
           logInternal(
             `[envelope] ❌ REJECTED message from ${sealed.envelope?.senderAgentId ?? "?"} ` +
@@ -399,6 +474,21 @@ class BuyerAgentExecutor implements AgentExecutor {
       : `✅ Seller vLEI delegation chain verified (${vLEIResult.verificationScript}) — proceeding`;
     this.respond(bus, taskId, contextId, verifiedMsg);
     // ─────────────────────────────────────────────────────────────────────────
+
+    // ── Audit Framework v6 — Iteration 2: parallel identity capture ─────────
+    // The existing verifyCounterparty() above gates the negotiation. Now we
+    // also run CredentialProvider.{loadOwnIdentity, verifyCounterparty} so
+    // the audit's identityProof block has the rich AgentIdentity shape.
+    // PlainJsonProvider and VleiProvider both honor the active env. Errors
+    // are swallowed — audit omits identityProof instead of blocking the deal.
+    await this.ensureOwnIdentity();
+    try {
+      const provider = getCredentialProvider();
+      const cpv = await provider.verifyCounterparty("buyer", "jupiterSellerAgent");
+      this.cpVerifications.set(negotiationId, cpv);
+    } catch (err: any) {
+      logInternal(`[identity] iter-2 verifyCounterparty failed: ${err?.message ?? err} (audit's identityProof.counterparty will be omitted)`);
+    }
 
     const initialOffer = userPrice ?? this.generateInitialOffer();
     logInternal(userPrice
@@ -645,6 +735,7 @@ class BuyerAgentExecutor implements AgentExecutor {
     // sellerResponseMode block (3 s timeout; failure stored as { error }).
     const sellerLiveMode = await this.fetchSellerLiveMode();
     const auditPathEsc  = logger.saveAuditJson({
+      ...this.buildIter2AuditParams(state.negotiationId),
       outcome:         "escalation",
       sellerLiveMode,
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
@@ -778,6 +869,7 @@ class BuyerAgentExecutor implements AgentExecutor {
     // sellerResponseMode block (3 s timeout; failure stored as { error }).
     const sellerLiveModeForAudit = await this.fetchSellerLiveMode();
     const auditPath = logger.saveAuditJson({
+      ...this.buildIter2AuditParams(state.negotiationId),
       outcome:         "success",
       sellerLiveMode:  sellerLiveModeForAudit,
       finalPrice:      data.acceptedPrice,
@@ -904,6 +996,7 @@ class BuyerAgentExecutor implements AgentExecutor {
       // sellerResponseMode block (3 s timeout; failure stored as { error }).
       const sellerLiveModeForAudit2 = await this.fetchSellerLiveMode();
       const auditPath2 = logger.saveAuditJson({
+        ...this.buildIter2AuditParams(state.negotiationId),
         outcome:         "success",
         sellerLiveMode:  sellerLiveModeForAudit2,
         finalPrice:      data.pricePerUnit,
@@ -1336,6 +1429,7 @@ class BuyerAgentExecutor implements AgentExecutor {
     // sellerResponseMode block (3 s timeout; failure stored as { error }).
     const sellerLiveModeEsc = await this.fetchSellerLiveMode();
     const auditPathEsc  = logger.saveAuditJson({
+      ...this.buildIter2AuditParams(state.negotiationId),
       outcome:         "escalation",
       sellerLiveMode:  sellerLiveModeEsc,
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
@@ -1688,6 +1782,19 @@ class BuyerAgentExecutor implements AgentExecutor {
         `payloadHash=${sealed.envelope.payloadHash.slice(0,12)}... type=${data.type} ` +
         `(NOT a KERI seal)`
       );
+
+      // Iter 2: record the outbound envelope in the per-deal message log so
+      // logger.saveAuditJson can emit messageLog[] at deal close (T3, T4).
+      // Guarded — some payloads (e.g. early diagnostic messages) may lack
+      // negotiationId/type; those are skipped silently.
+      if (data?.negotiationId && data?.type) {
+        getMessageLogCollector().recordSend({
+          negotiationId: data.negotiationId,
+          sealed,
+          payloadKind:   data.type,
+          round:         data.round,
+        });
+      }
 
       const message: Message = {
         messageId: uuidv4(), kind: "message", role: "agent", contextId,
