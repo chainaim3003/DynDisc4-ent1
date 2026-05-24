@@ -81,6 +81,19 @@ import type { AgentIdentity, VerificationResult } from "../../identity/Credentia
 import { getMessageLogCollector } from "../../shared/message-log-collector.js";
 import type { SigningMode } from "../../messaging/signed-message.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 3 imports.
+// Captures OfferData.scenarioIntent into SellerNegotiationState.receivedScenarioIntent
+// in handleBuyerOffer (audit-only; does NOT alter seller behavior — see
+// intent-types.ts header). Accumulates commitGateEvents in applyTreasuryConstraint,
+// runL2Path, applySellerConstraints, and handleEscalationNotice. Feeds both
+// into saveAuditJson via `buildIter3AuditParams()`. See
+// AUDIT-FRAMEWORK-V6-DECISIONS.md addendum 2026-05-24.
+// ============================================================================
+import type { ScenarioIntentExcerpt, SellerIntent, Situation } from "../../shared/intent-types.js";
+import type { CommitGateEvent } from "../../shared/negotiation-types.js";
+import type { ActualOutcomeFacts } from "../../shared/audit-blocks/intent-block.js";
+
 // ── Iteration 15: notifications (UI dashboard + WhatsApp via Meta Cloud API) ─
 // Same surface as buyer-agent. Seller code never sees a phone number; it
 // emits semantic AgentEvents and the notify router does the routing.
@@ -266,6 +279,77 @@ class SellerAgentExecutor implements AgentExecutor {
     };
   }
 
+  // ===========================================================================
+  // Audit Framework v6 — Iteration 3 helpers (mirror of buyer-agent).
+  // - buildIter3AuditParams: bundles intent + autonomy inputs for the 3 seller
+  //   saveAuditJson sites. Reads `state.receivedScenarioIntent` (seller-side
+  //   field name; buyer-side equivalent is `state.scenarioIntent`).
+  // - synthesizeDefaultSellerIntent / synthesizeDefaultSituation: build the
+  //   minimal fallback intent shapes from SELLER_CONFIG + state when no
+  //   scenario was propagated, so AGENT_DEFAULT_CONFIG audits still describe
+  //   the seller's own mandate.
+  // ===========================================================================
+  private buildIter3AuditParams(
+    negotiationId: string,
+    actual: ActualOutcomeFacts,
+  ): {
+    intentScenario?:         ScenarioIntentExcerpt;
+    intentDefaultSeller?:    SellerIntent;
+    intentDefaultSituation?: Situation;
+    intentActual:            ActualOutcomeFacts;
+    commitGateEvents:        CommitGateEvent[];
+  } {
+    const state = this.negotiations.get(negotiationId);
+    return {
+      intentScenario:         state?.receivedScenarioIntent,
+      intentDefaultSeller:    state ? this.synthesizeDefaultSellerIntent(state) : undefined,
+      intentDefaultSituation: state ? this.synthesizeDefaultSituation(state)    : undefined,
+      intentActual:           actual,
+      commitGateEvents:       state?.commitGateEvents ?? [],
+    };
+  }
+
+  private synthesizeDefaultSellerIntent(state: SellerNegotiationState): SellerIntent {
+    // Defaults reflect SELLER_CONFIG + the currently-resolved seller-response
+    // mode. Style falls back to "balanced" when state.buyerStyle was not
+    // propagated (legacy bare-CLI form).
+    const styleRaw = (state.buyerStyle ?? "balanced") as SellerIntent["style"];
+    const sellerResponseMode = resolveSellerResponseMode();
+    return {
+      goal:            "fill-capacity",
+      hardConstraints: {
+        sellerResponseMode,
+        minMarginPct:      Math.round(SELLER_CONFIG.targetProfitPercentage * 100),
+        floorPricePerUnit: SELLER_CONFIG.marginPrice,
+      },
+      softPreferences: {
+        targetMarginPct:       8,
+        preferredPaymentTerms: `Net ${SELLER_CONFIG.dd.paymentTermsDays}`,
+      },
+      style:            styleRaw,
+      walkAwayBehavior: "escalate",
+    };
+  }
+
+  private synthesizeDefaultSituation(state: SellerNegotiationState): Situation {
+    return {
+      product:  state.productCode ?? "FAB-COTTON-180GSM",
+      quantity: state.quantity,
+      market:   "normal",
+    };
+  }
+
+  /**
+   * Push a CommitGateEvent into the agent state's per-negotiation array.
+   * Lazy-initializes the array on first use. Safe no-op if state is missing.
+   */
+  private pushCommitGateEvent(negotiationId: string, ev: CommitGateEvent): void {
+    const state = this.negotiations.get(negotiationId);
+    if (!state) return;
+    if (!state.commitGateEvents) state.commitGateEvents = [];
+    state.commitGateEvents.push(ev);
+  }
+
   async cancelTask(taskId: string): Promise<void> {
     logInternal(`Task cancellation requested: ${taskId}`);
   }
@@ -429,6 +513,26 @@ class SellerAgentExecutor implements AgentExecutor {
     if (!treasuryResult || treasuryResult.approved) {
       return { decision, overrideApplied: false };
     }
+
+    // Iter 3 (Audit Framework v6): treasury rejected. Per DECISIONS.md Item 5,
+    // this is a TREASURY_VETO event — the agent committed (or would have
+    // committed) autonomously, while a stricter posture would have required
+    // human approval. Pushed regardless of which override branch runs below
+    // (ACCEPT→COUNTER, COUNTER price floor) because the trigger is the
+    // veto itself, not the override action taken.
+    this.pushCommitGateEvent(state.negotiationId, {
+      eventType:            "TREASURY_VETO",
+      round:                state.currentRound,
+      timestamp:            new Date().toISOString(),
+      triggerSource:        "seller-agent.applyTreasuryConstraint",
+      details:              `Treasury ACTUS rejected price ${state.lastBuyerOffer}. ` +
+                            `failReasons=${JSON.stringify(treasuryResult.failReasons)} ` +
+                            `minViablePrice=${treasuryResult.minViablePrice} ` +
+                            `npvOfDeal=${treasuryResult.npvOfDeal} ` +
+                            `netProfit=${treasuryResult.netProfit}`,
+      severity:             "high",
+      wouldRequireApproval: true,
+    });
 
     const minPrice = Math.max(
       treasuryResult.minViablePrice ?? SELLER_CONFIG.marginPrice,
@@ -635,6 +739,48 @@ class SellerAgentExecutor implements AgentExecutor {
       } as AgentEvent);
     }
 
+    // Iter 3 (Audit Framework v6): push commit-gate events when L2 produced a
+    // math override. Two cases per DECISIONS.md Item 5:
+    //   - treasury rejected the queried price → TREASURY_VETO (high severity,
+    //     would require human approval)
+    //   - mathOverride exists but treasury was approved (or not consulted) →
+    //     GUARDRAIL_OVERRIDE (low severity, informational, does NOT require
+    //     approval). Covers margin-floor and counter-price guardrails inside
+    //     l2-executive without conflating them with treasury vetoes.
+    if (out.l2Decision.mathOverride !== undefined) {
+      const trBundle = out.bundle.treasury;
+      const isTreasuryVeto =
+        trBundle?.success === true && trBundle.result?.approved === false;
+      if (isTreasuryVeto) {
+        const trResult = trBundle!.result!;
+        this.pushCommitGateEvent(state.negotiationId, {
+          eventType:            "TREASURY_VETO",
+          round,
+          timestamp:            new Date().toISOString(),
+          triggerSource:        "seller-agent.runL2Path",
+          details:              `L2 path: Treasury ACTUS rejected price ${buyerOffer}. ` +
+                                `failReasons=${JSON.stringify(trResult.failReasons ?? [])} ` +
+                                `minViablePrice=${trResult.minViablePrice} ` +
+                                `clampedTo=${out.l2Decision.mathOverride.clampedTo.price}`,
+          severity:             "high",
+          wouldRequireApproval: true,
+        });
+      } else {
+        this.pushCommitGateEvent(state.negotiationId, {
+          eventType:            "GUARDRAIL_OVERRIDE",
+          round,
+          timestamp:            new Date().toISOString(),
+          triggerSource:        "seller-agent.runL2Path",
+          details:              `L2 mathOverride applied (non-treasury). ` +
+                                `reason="${out.l2Decision.mathOverride.reason}" ` +
+                                `llmProposed=${JSON.stringify(out.l2Decision.mathOverride.llmProposed)} ` +
+                                `clampedTo=${JSON.stringify(out.l2Decision.mathOverride.clampedTo)}`,
+          severity:             "low",
+          wouldRequireApproval: false,
+        });
+      }
+    }
+
     // ── DecisionTrail entry (legacy-shape, best-effort mapping from L2) ────
     // TODO(β.4-cleanup): map is lossy. Promote to a discriminated union in β.5+
     // so the Decision Trail viewer can render L2-native fields (tacticsTrace,
@@ -732,7 +878,7 @@ class SellerAgentExecutor implements AgentExecutor {
     bus: ExecutionEventBus,
     taskId: string
   ) {
-    const { negotiationId, pricePerUnit, quantity, deliveryDate, productCode, buyerStyle } = data;
+    const { negotiationId, pricePerUnit, quantity, deliveryDate, productCode, buyerStyle, scenarioIntent } = data;
 
     const logger = new NegotiationLogger(negotiationId, "SELLER");
     this.loggers.set(negotiationId, logger);
@@ -801,6 +947,14 @@ class SellerAgentExecutor implements AgentExecutor {
       // state.productCode below to drive the inventory/credit/logistics consultation.
       productCode: productCode,
       buyerStyle:  buyerStyle,
+      // Iter 3 (Audit Framework v6) — capture buyer-propagated scenario intent
+      // for the audit's intent block at deal close. AUDIT-ONLY: this does NOT
+      // change seller behavior. SELLER_RESPONSE_MODE and SELLER_CONFIG still
+      // drive every decision. See DECISIONS.md Item 6 + intent-types.ts header.
+      receivedScenarioIntent: scenarioIntent,
+      // Iter 3 — events accumulator. Pushed to by applyTreasuryConstraint,
+      // runL2Path, applySellerConstraints, and handleEscalationNotice.
+      commitGateEvents: [],
     };
 
     this.negotiations.set(negotiationId, state);
@@ -1075,6 +1229,13 @@ class SellerAgentExecutor implements AgentExecutor {
     const buyerMaxForAudit   = this.resolveBuyerMax(state.negotiationId);
     const auditPath = logger.saveAuditJson({
       ...this.buildIter2AuditParams(state.negotiationId),
+      ...this.buildIter3AuditParams(state.negotiationId, {
+        status:        "REJECTED",
+        finalPrice:    Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
+        finalQuantity: state.quantity,
+        finalProduct:  state.productCode,
+        roundsUsed:    state.currentRound,
+      }),
       outcome:         "escalation",
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
       quantity:        state.quantity,
@@ -1172,8 +1333,36 @@ class SellerAgentExecutor implements AgentExecutor {
       const sellerMetaEsc = readAgentCardMetadata("jupiterSellerAgent");
       const trSummaryEsc = state?.lastTreasuryResult;
       const buyerMaxEsc = state ? this.resolveBuyerMax(state.negotiationId) : 400;
+
+      // Iter 3 (Audit Framework v6): the buyer sent ESCALATION_NOTICE because
+      // it hit maxRounds without convergence. Mirror its MAX_ROUNDS_REACHED
+      // event on the seller's commitGateEvents so both audits agree on what
+      // happened. Only push when we still have state (loggers without state
+      // are post-restart recoveries and we can't safely associate events).
+      if (state) {
+        this.pushCommitGateEvent(state.negotiationId, {
+          eventType:            "MAX_ROUNDS_REACHED",
+          round:                data.round,
+          timestamp:            new Date().toISOString(),
+          triggerSource:        "seller-agent.handleEscalationNotice",
+          details:              `Buyer ESCALATION_NOTICE received. ` +
+                                `buyerFinalOffer=${data.buyerFinalOffer} ` +
+                                `sellerFinalOffer=${data.sellerFinalOffer} ` +
+                                `gap=${data.gap}. buyerReportPath=${data.reportPath}`,
+          severity:             "high",
+          wouldRequireApproval: true,
+        });
+      }
+
       const auditPathEsc = logger.saveAuditJson({
         ...(state ? this.buildIter2AuditParams(state.negotiationId) : {}),
+        ...(state ? this.buildIter3AuditParams(state.negotiationId, {
+          status:        "ESCALATED",
+          finalPrice:    Math.round((data.buyerFinalOffer + data.sellerFinalOffer) / 2),
+          finalQuantity: state.quantity,
+          finalProduct:  state.productCode,
+          roundsUsed:    data.round,
+        }) : {}),
         outcome:         "escalation",
         finalPrice:      Math.round((data.buyerFinalOffer + data.sellerFinalOffer) / 2),
         quantity:        state?.quantity ?? 0,
@@ -1372,6 +1561,13 @@ class SellerAgentExecutor implements AgentExecutor {
     const buyerMaxForAudit = this.resolveBuyerMax(state.negotiationId);
     const auditPath = logger.saveAuditJson({
       ...this.buildIter2AuditParams(state.negotiationId),
+      ...this.buildIter3AuditParams(state.negotiationId, {
+        status:        "COMPLETED",
+        finalPrice:    data.acceptedPrice,
+        finalQuantity: state.quantity,
+        finalProduct:  state.productCode,
+        roundsUsed:    state.currentRound,
+      }),
       outcome:         "success",
       finalPrice:      data.acceptedPrice,
       quantity:        state.quantity,
@@ -1738,6 +1934,26 @@ class SellerAgentExecutor implements AgentExecutor {
       validatedDecision &&
       (validatedDecision.action !== llmDecision.action ||
        validatedDecision.price  !== llmDecision.price);
+
+    // Iter 3 (Audit Framework v6): when applySellerConstraints overrode the
+    // LLM proposal, that's a GUARDRAIL_OVERRIDE per DECISIONS.md Item 5.
+    // Informational only (wouldRequireApproval=false) — the override prevented
+    // a margin-violating ACCEPT or floored a too-low COUNTER, both of which
+    // are protective. Logged so a regulator can see how often the guardrails
+    // had to intervene. L2 path's equivalent override is captured in runL2Path.
+    if (constraintChanged && validatedDecision) {
+      this.pushCommitGateEvent(state.negotiationId, {
+        eventType:            "GUARDRAIL_OVERRIDE",
+        round:                state.currentRound,
+        timestamp:            new Date().toISOString(),
+        triggerSource:        "seller-agent.applySellerConstraints",
+        details:              `Legacy path: applySellerConstraints overrode LLM proposal. ` +
+                              `llmProposed=${JSON.stringify(llmProposalSnapshot)} ` +
+                              `clampedTo=action=${validatedDecision.action} price=${validatedDecision.price}`,
+        severity:             "low",
+        wouldRequireApproval: false,
+      });
+    }
 
     const entry: DecisionTrailEntry = {
       round:         state.currentRound,

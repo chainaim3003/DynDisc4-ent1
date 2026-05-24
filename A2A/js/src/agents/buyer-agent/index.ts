@@ -76,6 +76,19 @@ import type { AgentIdentity, VerificationResult } from "../../identity/Credentia
 import { getMessageLogCollector } from "../../shared/message-log-collector.js";
 import type { SigningMode } from "../../messaging/signed-message.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 3 imports.
+// Captures scenarioIntent on state (set when buyer is started with
+// `--scenario <id>`), accumulates commitGateEvents over the deal lifecycle
+// (MAX_ROUNDS_REACHED in escalateToHuman, COUNTERPARTY_REJECT_FINAL in
+// handleSellerRejection), and feeds both into saveAuditJson's iter-3 params
+// via `buildIter3AuditParams()`. See AUDIT-FRAMEWORK-V6-DECISIONS.md
+// addendum 2026-05-24.
+// ============================================================================
+import type { Scenario, ScenarioIntentExcerpt, BuyerIntent, Situation } from "../../shared/intent-types.js";
+import type { CommitGateEvent } from "../../shared/negotiation-types.js";
+import type { ActualOutcomeFacts } from "../../shared/audit-blocks/intent-block.js";
+
 // WEDGE1 / Guarantee A — dual-parser for 'start negotiation' commands.
 // Pure function, no side effects. Legacy bare-number form stays byte-identical
 // (verified by scripts/test-cli-parser.ts). Flagged multi-dimensional form is
@@ -294,6 +307,74 @@ class BuyerAgentExecutor implements AgentExecutor {
     };
   }
 
+  // ===========================================================================
+  // Audit Framework v6 — Iteration 3 helpers.
+  // - buildIter3AuditParams: bundles all iter-3 inputs for saveAuditJson at
+  //   each of the 4 buyer-side call sites. Mirrors buildIter2AuditParams.
+  // - synthesizeDefaultBuyerIntent / synthesizeDefaultSituation: build the
+  //   minimal fallback intent shapes from current state when no scenario was
+  //   declared, so the audit's intent block can still describe the buyer's
+  //   own mandate from CLI args (AGENT_DEFAULT_CONFIG intent source).
+  // ===========================================================================
+  private buildIter3AuditParams(
+    negotiationId: string,
+    actual: ActualOutcomeFacts,
+  ): {
+    intentScenario?:        ScenarioIntentExcerpt;
+    intentDefaultBuyer?:    BuyerIntent;
+    intentDefaultSituation?: Situation;
+    intentActual:           ActualOutcomeFacts;
+    commitGateEvents:       CommitGateEvent[];
+  } {
+    const state = this.negotiations.get(negotiationId);
+    return {
+      intentScenario:         state?.scenarioIntent,
+      intentDefaultBuyer:     state ? this.synthesizeDefaultBuyerIntent(state) : undefined,
+      intentDefaultSituation: state ? this.synthesizeDefaultSituation(state)   : undefined,
+      intentActual:           actual,
+      commitGateEvents:       state?.commitGateEvents ?? [],
+    };
+  }
+
+  private synthesizeDefaultBuyerIntent(state: BuyerNegotiationState): BuyerIntent {
+    // Defaults reflect honest current configuration. Style falls back to
+    // "balanced" when state.buyerStyle is undefined (legacy bare-CLI form).
+    const styleRaw = (state.buyerStyle ?? "balanced") as BuyerIntent["style"];
+    return {
+      goal:            "secure-supply",
+      hardConstraints: {
+        maxBudgetPerUnit:     state.maxBudget,
+        minQuantity:          state.targetQuantity,
+        requiredDeliveryDate: state.deliveryDate,
+      },
+      softPreferences: {
+        targetPricePerUnit:    BUYER_CONFIG.targetPrice,
+        preferredPaymentTerms: "Net 30",
+      },
+      style:            styleRaw,
+      walkAwayBehavior: "escalate",
+    };
+  }
+
+  private synthesizeDefaultSituation(state: BuyerNegotiationState): Situation {
+    return {
+      product:  state.productCode ?? "FAB-COTTON-180GSM",
+      quantity: state.targetQuantity,
+      market:   "normal",
+    };
+  }
+
+  /**
+   * Push a CommitGateEvent into the agent state's per-negotiation array.
+   * Lazy-initializes the array on first use. Safe no-op if state is missing.
+   */
+  private pushCommitGateEvent(negotiationId: string, ev: CommitGateEvent): void {
+    const state = this.negotiations.get(negotiationId);
+    if (!state) return;
+    if (!state.commitGateEvents) state.commitGateEvents = [];
+    state.commitGateEvents.push(ev);
+  }
+
   async cancelTask(taskId: string): Promise<void> {
     logInternal(`Task cancellation requested: ${taskId}`);
   }
@@ -357,6 +438,9 @@ class BuyerAgentExecutor implements AgentExecutor {
           buyerBudget:   parsed.buyerBudget,
           buyerStyle:    parsed.buyerStyle,
           buyerDeadline: parsed.buyerDeadline,
+          // Iter 3 — hand the full Scenario through; startNegotiation
+          // converts it to ScenarioIntentExcerpt and stores on state.
+          scenarioIntent: parsed.scenarioIntent,
         });
         return;
       }
@@ -443,6 +527,10 @@ class BuyerAgentExecutor implements AgentExecutor {
       buyerBudget:   number;
       buyerStyle:    string;
       buyerDeadline: string;     // ISO date already validated by cli-parser
+      // Iter 3 (Audit Framework v6) — full Scenario from cli-parser when
+      // --scenario was used. startNegotiation converts to ScenarioIntentExcerpt
+      // for state + OfferData (audit-only). Undefined for the bare flagged form.
+      scenarioIntent?: Scenario;
     },
   ) {
     const negotiationId = `NEG-${Date.now()}`;
@@ -522,6 +610,22 @@ class BuyerAgentExecutor implements AgentExecutor {
       // WEDGE1 / M2-γ — multi-dim context (undefined in legacy form)
       productCode: multiDim?.productCode,
       buyerStyle:  multiDim?.buyerStyle,
+      // Iter 3 (Audit Framework v6) — capture the declared mandate so the
+      // intent audit block can describe it at deal close. Excerpt (subset)
+      // of the full Scenario, audit-only. See DECISIONS.md Item 6.
+      scenarioIntent: multiDim?.scenarioIntent
+        ? {
+            scenarioId:      multiDim.scenarioIntent.id,
+            scenarioTitle:   multiDim.scenarioIntent.title,
+            buyerIntent:     multiDim.scenarioIntent.buyerIntent,
+            sellerIntent:    multiDim.scenarioIntent.sellerIntent,
+            situation:       multiDim.scenarioIntent.situation,
+            expectedOutcome: multiDim.scenarioIntent.expectedOutcome,
+          }
+        : undefined,
+      // Iter 3 — events accumulator. Pushed to by escalateToHuman and
+      // handleSellerRejection (and possibly future hook points).
+      commitGateEvents: [],
     };
 
     this.negotiations.set(negotiationId, state);
@@ -567,6 +671,10 @@ class BuyerAgentExecutor implements AgentExecutor {
       // and runL2Path passes productCode to the sub-agent consultations.
       productCode: state.productCode,
       buyerStyle:  state.buyerStyle,
+      // Iter 3 (Audit Framework v6) — audit-only intent propagation. The
+      // seller captures this into SellerNegotiationState.receivedScenarioIntent
+      // for its own intent audit block. Does NOT alter seller behavior.
+      scenarioIntent: state.scenarioIntent,
     };
 
     logger.log({ round: 1, messageType: "OFFER", from: "BUYER",
@@ -734,8 +842,32 @@ class BuyerAgentExecutor implements AgentExecutor {
     // v6 Iter1 / Phase 3c: fetch seller's live mode for the audit's
     // sellerResponseMode block (3 s timeout; failure stored as { error }).
     const sellerLiveMode = await this.fetchSellerLiveMode();
+
+    // Iter 3: this handler runs because the seller rejected our offer.
+    // Per DECISIONS.md Item 5, that's a COUNTERPARTY_REJECT_FINAL event
+    // worthy of a human-approval gate in a stricter posture. Push BEFORE
+    // saveAuditJson so buildIter3AuditParams picks it up.
+    this.pushCommitGateEvent(state.negotiationId, {
+      eventType:            "COUNTERPARTY_REJECT_FINAL",
+      round:                state.currentRound,
+      timestamp:            new Date().toISOString(),
+      triggerSource:        "buyer-agent.handleSellerRejection",
+      details:              `Seller REJECT_OFFER received. finalRound=${data.finalRound}. ` +
+                            `buyerFinalOffer=${buyerFinalOffer} sellerFinalOffer=${sellerFinalOffer} ` +
+                            `gap=${gap}. reason="${data.reason}"`,
+      severity:             "high",
+      wouldRequireApproval: true,
+    });
+
     const auditPathEsc  = logger.saveAuditJson({
       ...this.buildIter2AuditParams(state.negotiationId),
+      ...this.buildIter3AuditParams(state.negotiationId, {
+        status:        "REJECTED",
+        finalPrice:    Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
+        finalQuantity: state.targetQuantity,
+        finalProduct:  state.productCode,
+        roundsUsed:    state.currentRound,
+      }),
       outcome:         "escalation",
       sellerLiveMode,
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
@@ -870,6 +1002,13 @@ class BuyerAgentExecutor implements AgentExecutor {
     const sellerLiveModeForAudit = await this.fetchSellerLiveMode();
     const auditPath = logger.saveAuditJson({
       ...this.buildIter2AuditParams(state.negotiationId),
+      ...this.buildIter3AuditParams(state.negotiationId, {
+        status:        "COMPLETED",
+        finalPrice:    data.acceptedPrice,
+        finalQuantity: state.targetQuantity,
+        finalProduct:  state.productCode,
+        roundsUsed:    state.currentRound,
+      }),
       outcome:         "success",
       sellerLiveMode:  sellerLiveModeForAudit,
       finalPrice:      data.acceptedPrice,
@@ -997,6 +1136,13 @@ class BuyerAgentExecutor implements AgentExecutor {
       const sellerLiveModeForAudit2 = await this.fetchSellerLiveMode();
       const auditPath2 = logger.saveAuditJson({
         ...this.buildIter2AuditParams(state.negotiationId),
+        ...this.buildIter3AuditParams(state.negotiationId, {
+          status:        "COMPLETED",
+          finalPrice:    data.pricePerUnit,
+          finalQuantity: state.targetQuantity,
+          finalProduct:  state.productCode,
+          roundsUsed:    state.currentRound,
+        }),
         outcome:         "success",
         sellerLiveMode:  sellerLiveModeForAudit2,
         finalPrice:      data.pricePerUnit,
@@ -1428,8 +1574,46 @@ class BuyerAgentExecutor implements AgentExecutor {
     // v6 Iter1 / Phase 3c: fetch seller's live mode for the audit's
     // sellerResponseMode block (3 s timeout; failure stored as { error }).
     const sellerLiveModeEsc = await this.fetchSellerLiveMode();
+
+    // Iter 3: max-rounds escalation. Per DECISIONS.md Item 5, this is a
+    // MAX_ROUNDS_REACHED event that would have fired a human-approval gate
+    // in a stricter posture. Push BEFORE saveAuditJson so buildIter3AuditParams
+    // picks it up via state.commitGateEvents.
+    this.pushCommitGateEvent(state.negotiationId, {
+      eventType:            "MAX_ROUNDS_REACHED",
+      round:                state.maxRounds,
+      timestamp:            new Date().toISOString(),
+      triggerSource:        "buyer-agent.escalateToHuman",
+      details:              `Reached maxRounds=${state.maxRounds} without convergence. ` +
+                            `buyerFinalOffer=${buyerFinalOffer} sellerFinalOffer=${sellerFinalOffer} gap=${gap}`,
+      severity:             "high",
+      wouldRequireApproval: true,
+    });
+
+    // Iter 2 ordering fix (caught by iter-3 cross-check): send ESCALATION_NOTICE
+    // to the seller BEFORE saveAuditJson runs. sendToSeller's
+    // getMessageLogCollector().recordSend() fires synchronously (before its
+    // network await), so the buyer's messageLog snapshot picks up this
+    // outbound entry. Without this reorder, the buyer's audit ended with
+    // 3 sends + 3 receives while the seller's audit correctly recorded 4
+    // receives, failing the T3 cross-check on every escalation deal. The
+    // notifier.publish call below was already after saveAuditJson, so its
+    // ordering relative to the audit write is unchanged.
+    await this.sendToSeller({
+      type: "ESCALATION_NOTICE", negotiationId: state.negotiationId,
+      round: state.maxRounds, timestamp: new Date().toISOString(),
+      from: "BUYER", buyerFinalOffer, sellerFinalOffer, gap, reportPath,
+    } as EscalationNoticeData, contextId);
+
     const auditPathEsc  = logger.saveAuditJson({
       ...this.buildIter2AuditParams(state.negotiationId),
+      ...this.buildIter3AuditParams(state.negotiationId, {
+        status:        "ESCALATED",
+        finalPrice:    Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
+        finalQuantity: state.targetQuantity,
+        finalProduct:  state.productCode,
+        roundsUsed:    state.maxRounds,
+      }),
       outcome:         "escalation",
       sellerLiveMode:  sellerLiveModeEsc,
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
@@ -1479,11 +1663,11 @@ class BuyerAgentExecutor implements AgentExecutor {
       },
     } as AgentEvent);
 
-    await this.sendToSeller({
-      type: "ESCALATION_NOTICE", negotiationId: state.negotiationId,
-      round: state.maxRounds, timestamp: new Date().toISOString(),
-      from: "BUYER", buyerFinalOffer, sellerFinalOffer, gap, reportPath,
-    } as EscalationNoticeData, contextId);
+    // Note: the ESCALATION_NOTICE send used to live here, AFTER saveAuditJson
+    // and notifier.publish. It was moved up to before saveAuditJson (see
+    // "Iter 2 ordering fix" block above) so the buyer's messageLog snapshot
+    // includes the outbound ESCALATION_NOTICE entry, fixing the T3 cross-
+    // check on escalation deals.
 
     this.respond(bus, taskId, contextId,
       `✗ NO DEAL — escalated to human procurement officer for review.\n` +

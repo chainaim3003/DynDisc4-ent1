@@ -44,6 +44,30 @@ import {
     type MessageLogEntry,
 } from "./message-log-collector.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 3 imports.
+// Intent block + autonomy block. Pattern follows iter-2: callers pass
+// rich raw inputs, this file invokes the audit-block builders and spreads
+// the results into `auditDoc`.
+// ============================================================================
+import type {
+    BuyerIntent,
+    SellerIntent,
+    Situation,
+    ScenarioIntentExcerpt,
+} from "./intent-types.js";
+import type { CommitGateEvent } from "./negotiation-types.js";
+import {
+    buildIntentBlock,
+    type IntentBlock,
+    type ActualOutcomeFacts,
+} from "./audit-blocks/intent-block.js";
+import {
+    buildAutonomyBlock,
+    type AutonomyBlock,
+    type HumanOversightPosition,
+} from "./audit-blocks/autonomy-block.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
@@ -680,6 +704,41 @@ export class NegotiationLogger {
         signingMode?:              SigningMode;
         signerProvider?:           string;
         signingTierOverride?:      MessageSigningTier;
+        // ====================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 3 inputs.
+        //
+        // INTENT BLOCK — reflects the declared mandate (or agent default).
+        //   - intentScenario:        ScenarioIntentExcerpt captured on the
+        //                            agent's state. Buyer captures it from
+        //                            `loadScenario()` at startNegotiation;
+        //                            seller captures it from OfferData.scenarioIntent.
+        //                            When undefined, the block falls back to
+        //                            the default* fields below.
+        //   - intentDefault{Buyer,Seller,Situation}: minimal fallback the
+        //                            agent supplies so the audit can still
+        //                            describe its own mandate from CLI args.
+        //   - intentActual:          facts about the deal at close. Drives
+        //                            deviation analysis (T2).
+        //
+        // AUTONOMY BLOCK — reflects the autonomy posture + commitGate.
+        //   - commitGateEvents:      events accumulated in `state.commitGateEvents`
+        //                            by the agent over the deal lifecycle.
+        //                            Default: []. Populates wouldFireAt[] (T3).
+        //   - humanOversightPosition: usually omitted (default HOOTL_with_guardrails).
+        //                            Override for tests or future postures.
+        //   - guardrails:            override for active guardrails list.
+        //
+        // All Iter 3 params are optional. When all are absent, the blocks
+        // are not emitted (backward-compat with pre-iter-3 callers).
+        // ====================================================================
+        intentScenario?:           ScenarioIntentExcerpt;
+        intentDefaultBuyer?:       BuyerIntent;
+        intentDefaultSeller?:      SellerIntent;
+        intentDefaultSituation?:   Situation;
+        intentActual?:             ActualOutcomeFacts;
+        commitGateEvents?:         CommitGateEvent[];
+        humanOversightPosition?:   HumanOversightPosition;
+        guardrails?:               string[];
     }): string {
         // v6 Iter1: per-deal folder; mkdir handled inside getDealFolder().
         const dir = getDealFolder(this.negotiationId);
@@ -750,6 +809,48 @@ export class NegotiationLogger {
             agentAID:        params.counterpartyVerification.counterparty.agentAID,
         } : undefined;
 
+        // ================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 3: intent + autonomy blocks.
+        // Emitted whenever the caller passed AT LEAST ONE Iter 3 input.
+        // Backward-compat: pre-iter-3 callers omit all Iter 3 params and
+        // these blocks remain undefined (not spread into auditDoc).
+        // ================================================================
+        const hasIntentInputs =
+            params.intentScenario !== undefined ||
+            params.intentDefaultBuyer !== undefined ||
+            params.intentDefaultSeller !== undefined ||
+            params.intentDefaultSituation !== undefined ||
+            params.intentActual !== undefined;
+
+        let intent: IntentBlock | undefined;
+        if (hasIntentInputs && params.intentActual) {
+            intent = buildIntentBlock({
+                perspective:         this.myRole,
+                scenarioIntent:      params.intentScenario,
+                actual:              params.intentActual,
+                defaultBuyerIntent:  params.intentDefaultBuyer,
+                defaultSellerIntent: params.intentDefaultSeller,
+                defaultSituation:    params.intentDefaultSituation,
+            });
+        }
+
+        const hasAutonomyInputs =
+            params.commitGateEvents !== undefined ||
+            params.humanOversightPosition !== undefined ||
+            params.guardrails !== undefined;
+
+        let autonomy: AutonomyBlock | undefined;
+        if (hasAutonomyInputs || hasIntentInputs) {
+            // When the caller has wired iter 3 at all (intent OR autonomy inputs),
+            // emit the autonomy block. The defaults are honest for the current
+            // state — HOOTL_with_guardrails + zero events when no events were passed.
+            autonomy = buildAutonomyBlock({
+                commitGateEvents:        params.commitGateEvents ?? [],
+                humanOversightPosition:  params.humanOversightPosition,
+                guardrails:              params.guardrails,
+            });
+        }
+
         const auditDoc = {
             negotiationId:  this.negotiationId,
             perspective:    this.myRole,
@@ -810,6 +911,17 @@ export class NegotiationLogger {
             identityProof,
             messageSigningPosture,
             messageLog,
+            // ================================================================
+            // AUDIT FRAMEWORK V6 — Iteration 3 audit blocks.
+            // - intent:    declared mandate (or agent default) + expectedOutcome
+            //              with `shape` discriminator + deviationFromIntent.
+            // - autonomy:  six pillars + humanOversightPosition + commitGate
+            //              with wouldFireAt[] events.
+            // Both blocks are undefined when no Iter 3 inputs were passed,
+            // preserving backward compat with iter-2 callers.
+            // ================================================================
+            intent,
+            autonomy,
             negotiation: {
                 roundsUsed:      params.roundsUsed,
                 maxRounds:       params.maxRounds,

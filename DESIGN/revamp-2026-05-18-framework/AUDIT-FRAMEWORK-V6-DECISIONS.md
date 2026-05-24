@@ -155,6 +155,166 @@ This addendum does not modify Q15 (locked value remains "add `HASH_ENVELOPE`
 as the 5th tier"); it documents the full set of sibling values that Iter 2
 encodes into the audit JSON schema.
 
+### 2026-05-24 — Notes addendum: Iter 3 vocabulary lock (intent + autonomy)
+
+Iter 3 emits two new audit blocks: `intent` and `autonomy`. Q9 (autonomy
+model), Q31 (discriminator placement), and Q32 (commitGate state enum) lock
+the **structure** but leave the **vocabulary** open. This addendum locks
+the vocabulary so future iterations do not silently redefine these enums.
+
+Nothing in this addendum changes the locked value column for Q9 / Q31 / Q32;
+it only supplies the sibling values that Iter 3 encodes.
+
+#### Item 1 — `autonomy.capabilitiesActive` six pillars (Q9 Option C)
+
+Locked vocabulary, mapped to the procurement agents' actual behavior today.
+Each entry on the audit block is `{ active: boolean, justification: string,
+deferredTo?: string }`.
+
+| Pillar | Meaning | Active today? |
+|---|---|---|
+| `goalInterpretation` | Agent receives a mandate and parses it into actionable parameters | true (`scenario-loader` / `cli-parser`) |
+| `planning` | Agent chooses its own round-by-round action sequence | true (buyer `decideAction`, seller L2 reasoner) |
+| `toolInvocation` | Agent calls sub-agents / external services without per-call human approval | true (advisor consultations, ACTUS, market data) |
+| `commitmentAuthority` | Agent commits binding outcomes (PO / Invoice) without human approval | true (buyer auto-commits on `ACCEPT_OFFER`) |
+| `peerCommunication` | Agent talks directly to other agents (A2A) without human relay | true (buyer↔seller, both↔treasury) |
+| `learningFromOutcome` | Agent modifies future behavior based on past outcomes | false (L4 deferred) |
+
+Ordering is the canonical order in which Iter 3 emits the six rows. The enum
+is closed: adding a seventh pillar requires a new addendum.
+
+#### Item 2 — `autonomy.humanOversightPosition` enum
+
+Locked enum, ordered weakest → strongest human oversight:
+
+`"HITC"` | `"HITL"` | `"HITL_with_guardrails"` | `"HOTL"` | `"HOTL_with_guardrails"` | `"HOOTL"` | `"HOOTL_with_guardrails"`
+
+Current state value: **`"HOOTL_with_guardrails"`** (matches PLAN Iter 3 T4).
+
+Sibling field `autonomy.guardrails: string[]` enumerates the active guardrails.
+For the current state: `["maxRounds=3", "treasury-ACTUS-veto", "applySellerConstraints"]`.
+
+#### Item 3 — `intent.expectedOutcome.shape` discriminator enum (Q31 Option A)
+
+Q31 locks "sibling fields next to `outcome`" but does not enumerate `shape`.
+Locked enum:
+
+- `"PRICE_RANGE_CLOSE"` — author expects deal to close within a price range
+- `"POINT_CLOSE"` — author expects deal to close near a single target price
+- `"ESCALATION_EXPECTED"` — author explicitly expects escalation
+- `"ABANDON_EXPECTED"` — author expects walk-away with no escalation
+- `"FREE_TEXT"` — author wrote `likely` as free-form text; no machine-parseable shape
+
+`shape` is **inferred at audit-write time** from the scenario's
+`expectedOutcome.likely` string via a small heuristic in `intent-block.ts`:
+- regex matches a numeric range (e.g. `₹370–₹390`, `370-390`, `370 to 390`) → `PRICE_RANGE_CLOSE`
+- regex matches keyword `escalat` → `ESCALATION_EXPECTED`
+- regex matches keyword `abandon|walk away|walk-away` → `ABANDON_EXPECTED`
+- regex matches a single price target with no range → `POINT_CLOSE`
+- otherwise → `FREE_TEXT`
+
+No false precision. When `shape` is `FREE_TEXT`, no derived numeric fields
+(e.g. `priceRange`) are emitted.
+
+Sibling fields on `expectedOutcome` (per Q31 Option A — next to `outcome`,
+not nested deeper):
+- `shape` — the discriminator above
+- `likely` — verbatim from scenario
+- `possible` — verbatim (optional)
+- `failureMode` — verbatim (optional)
+- `priceRange?` — `{ minPerUnit, maxPerUnit, currency }`, only when `shape=PRICE_RANGE_CLOSE`
+- `roundRange?` — `{ minRounds, maxRounds }`, only when parseable from `likely`
+
+#### Item 4 — `intent.deviationFromIntent.dimensions[]` taxonomy
+
+Locked dimension enum. Each entry on `dimensions[]` is
+`{ dimension, expected, actual, severity, note }`:
+
+- `"outcomeShape"` — expected shape vs actual deal status (CLOSED / ESCALATED / FAILED / REJECTED)
+- `"pricePerUnit"` — parsed price range vs actual final unit price
+- `"roundCount"` — parsed round range vs actual rounds used
+- `"productMismatch"` — `situation.product` vs actual closed product
+- `"quantityMismatch"` — `situation.quantity` vs actual closed quantity
+
+Severity enum: `"high"` | `"medium"` | `"low"` | `"none"`. `dimensions[]` is
+`[]` (empty array) when there is no deviation OR no declared intent — the
+empty array is explicit, not omitted, so absence is distinguishable from
+"never declared."
+
+Sibling field `intent.intentSource: string`:
+- `"SCENARIO_DECLARED"` — buyer was started with `--scenario <id>`
+- `"AGENT_DEFAULT_CONFIG"` — no scenario; falling back to agent's hardcoded defaults
+- `"NONE"` — nothing known (defensive default)
+
+#### Item 5 — `autonomy.commitGate.wouldFireAt[]` event taxonomy
+
+Today `commitGate.state` is **always `"NOT_REQUIRED"`** (no human-approval
+gate exists in the procurement agents). The 8-value enum (Q32) is reserved
+vocabulary; only `NOT_REQUIRED` is wired today.
+
+`wouldFireAt[]` records events that *would have* fired a commit gate if one
+existed. Locked event types:
+
+- `"TREASURY_VETO"` — seller's `applyTreasuryConstraint()` or L2's `runL2Path` rejects on ACTUS / NPV / safety-threshold grounds. `wouldRequireApproval: true`.
+- `"MAX_ROUNDS_REACHED"` — buyer's `escalateToHuman` invoked because `currentRound >= maxRounds`. `wouldRequireApproval: true`.
+- `"COUNTERPARTY_REJECT_FINAL"` — buyer received a `finalRound: true` REJECT from seller. `wouldRequireApproval: true`.
+- `"GUARDRAIL_OVERRIDE"` — `applySellerConstraints` overrode the LLM proposal. Informational only. `wouldRequireApproval: false`.
+
+Each entry: `{ eventType, round, timestamp, triggerSource, details, severity, wouldRequireApproval }`.
+
+Severity reuses the iter-4 dimension severity enum (`high` / `medium` / `low` / `none`).
+
+Both agents accumulate per-negotiation arrays (`state.commitGateEvents`)
+parallel to how `decisionTrail` is accumulated today. Cleared by
+`message-log-collector`-style cleanup at deal close in iter 4+ if needed;
+for iter 3, in-memory map keyed by `negotiationId` is sufficient.
+
+#### Item 6 — `scenarioIntent` propagation buyer → seller via `OfferData`
+
+`intent-types.ts` documents that today the seller's behavior is driven by its
+`.env` (`SELLER_RESPONSE_MODE`) and hardcoded `SELLER_CONFIG`; the scenario's
+`sellerIntent` is captured in the JSON but **not yet transmitted** to the
+seller agent, with the explicit note that doing so requires extending the
+OFFER envelope schema and was out of CONT8 scope.
+
+Iter 3 takes that step, **scoped strictly to audit purposes** (not behavior).
+The seller's runtime behavior remains unchanged — it continues to act on its
+`.env` and `SELLER_CONFIG`. Iter 3 only records the received intent in the
+seller's audit block.
+
+New type `ScenarioIntentExcerpt` in `shared/intent-types.ts`:
+
+```ts
+export interface ScenarioIntentExcerpt {
+  scenarioId:      string;
+  scenarioTitle:   string;
+  buyerIntent:     BuyerIntent;
+  sellerIntent:    SellerIntent;
+  situation:       Situation;
+  expectedOutcome: ExpectedOutcome;
+}
+```
+
+Wiring:
+- `BuyerNegotiationState.scenarioIntent?: ScenarioIntentExcerpt` — populated in `startNegotiation` if `--scenario <id>` was passed.
+- `OfferData.scenarioIntent?: ScenarioIntentExcerpt` — new optional field; populated on the first offer the buyer sends.
+- `SellerNegotiationState.receivedScenarioIntent?: ScenarioIntentExcerpt` — captured in `handleBuyerOffer` from `OfferData.scenarioIntent`.
+
+Both sides build their `intent` block from their own state at deal close.
+When no scenario was declared, `intent.intentSource = "AGENT_DEFAULT_CONFIG"`
+and both `buyerIntent` / `sellerIntent` blocks are derived from the agents'
+hardcoded defaults instead.
+
+This wire is **audit-only**. The intent-types.ts honesty comment about
+seller-intent NOT driving seller behavior **remains accurate**.
+
+#### What this addendum does NOT change
+
+- Q9 / Q31 / Q32 locked value columns — unchanged.
+- Seller's runtime behavior — unchanged. `SELLER_RESPONSE_MODE` and `SELLER_CONFIG` continue to drive decisions.
+- `commitGate.state` runtime value — remains `"NOT_REQUIRED"` until a real commit gate is built (post-MVP).
+- `learningFromOutcome` pillar — remains `false` until L4 ships.
+
 ---
 
 **End of decisions reference.**
