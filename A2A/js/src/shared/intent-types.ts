@@ -226,3 +226,47 @@ export interface Scenario {
     declaredButDeferred: string[];
   };
 }
+
+// =============================================================================
+// Audit Framework v6 / Iter 3 — ScenarioIntentExcerpt
+// =============================================================================
+//
+// Subset of `Scenario` carried across the wire from buyer → seller (via
+// `OfferData.scenarioIntent?`) so the seller's audit block can record the
+// declared intent it was responding to.
+//
+// IMPORTANT — audit-only:
+//   The seller's runtime behavior is STILL driven by its .env
+//   (SELLER_RESPONSE_MODE) and hardcoded SELLER_CONFIG. Receiving this
+//   excerpt does NOT cause the seller to honor `sellerIntent.goal`,
+//   `sellerIntent.style`, etc. — those remain deferred. Iter 3 only
+//   reads the excerpt at deal close to populate the `intent` audit block
+//   on the seller's audit JSON.
+//
+// See AUDIT-FRAMEWORK-V6-DECISIONS.md § "2026-05-24 — Notes addendum: Iter 3
+// vocabulary lock" Item 6 for the design lock.
+//
+// Why an excerpt and not the full Scenario? Three reasons:
+//   1. Forward compatibility — `Scenario.honored` and `Scenario.description`
+//      are author metadata for the UI card; the seller's audit doesn't
+//      need them and including them would couple the wire schema to UI
+//      concerns.
+//   2. Size discipline — the OFFER envelope is signed and hashed; keeping
+//      its payload focused is good hygiene.
+//   3. Audit honesty — only the fields that materially describe the
+//      mandate belong on the audit block.
+
+export interface ScenarioIntentExcerpt {
+  /** Stable scenario id, e.g. "happy-path-cotton". */
+  scenarioId:      string;
+  /** Short title for human readers of the audit JSON. */
+  scenarioTitle:   string;
+  /** Full BuyerIntent as declared in the scenario file. */
+  buyerIntent:     BuyerIntent;
+  /** Full SellerIntent as declared (audit-only — NOT acted on; see header). */
+  sellerIntent:    SellerIntent;
+  /** Full Situation block. */
+  situation:       Situation;
+  /** Full ExpectedOutcome block. */
+  expectedOutcome: ExpectedOutcome;
+}

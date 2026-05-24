@@ -1,5 +1,11 @@
 // ================= SHARED NEGOTIATION TYPES =================
 
+// Iter 3 (Audit Framework v6) — ScenarioIntentExcerpt is the audit-only
+// payload carried on OfferData.scenarioIntent and stored on agent state
+// for use by `shared/audit-blocks/intent-block.ts` at deal close.
+// See AUDIT-FRAMEWORK-V6-DECISIONS.md § "2026-05-24 ... Item 6".
+import type { ScenarioIntentExcerpt } from "./intent-types.js";
+
 export type NegotiationStatus =
     | "INITIATED"
     | "NEGOTIATING"
@@ -36,6 +42,16 @@ export interface OfferData extends NegotiationDataBase {
     // these as optional and fall back to their existing defaults when undefined.
     productCode?: string;     // e.g. "FAB-COTTON-180GSM"
     buyerStyle?:  string;     // TKI five: aggressive|assertive|balanced|cooperative|win-win-seeking
+
+    // Iter 3 (Audit Framework v6) — audit-only payload. Populated on the
+    // FIRST OFFER the buyer sends when the negotiation was started with
+    // `--scenario <id>`. The seller captures this onto
+    // SellerNegotiationState.receivedScenarioIntent in handleBuyerOffer
+    // and uses it ONLY for its `intent` audit block at deal close. The
+    // seller's runtime behavior is NOT affected — it still follows its
+    // own .env (SELLER_RESPONSE_MODE) and SELLER_CONFIG. See
+    // AUDIT-FRAMEWORK-V6-DECISIONS.md § "2026-05-24 ... Item 6".
+    scenarioIntent?: ScenarioIntentExcerpt;
 }
 
 export interface CounterOfferData extends NegotiationDataBase {
@@ -227,6 +243,57 @@ export interface DecisionTrailEntry {
     };
 }
 
+// =============================================================================
+// Audit Framework v6 / Iter 3 — CommitGateEvent
+// =============================================================================
+//
+// Per-negotiation list of events that would have fired a human-approval
+// commit gate IF one existed. Today no such gate exists —
+// `autonomy.commitGate.state` is always `"NOT_REQUIRED"`. This array is
+// emitted into `autonomy.commitGate.wouldFireAt[]` so a regulator reviewing
+// the audit can see what the agent decided autonomously that a future
+// stricter posture might require human approval for.
+//
+// Event types are locked in AUDIT-FRAMEWORK-V6-DECISIONS.md § "2026-05-24
+// ... Item 5":
+//
+//   TREASURY_VETO            — ACTUS / NPV / safety-threshold rejection
+//                              (wouldRequireApproval: true)
+//   MAX_ROUNDS_REACHED       — buyer escalateToHuman on round exhaustion
+//                              (wouldRequireApproval: true)
+//   COUNTERPARTY_REJECT_FINAL— buyer received finalRound=true REJECT
+//                              (wouldRequireApproval: true)
+//   GUARDRAIL_OVERRIDE       — applySellerConstraints overrode LLM proposal;
+//                              informational only (wouldRequireApproval: false)
+//
+// Both agents accumulate events in-memory on their state, parallel to how
+// `decisionTrail` is accumulated today.
+
+export type CommitGateEventType =
+    | "TREASURY_VETO"
+    | "MAX_ROUNDS_REACHED"
+    | "COUNTERPARTY_REJECT_FINAL"
+    | "GUARDRAIL_OVERRIDE";
+
+export type CommitGateEventSeverity = "high" | "medium" | "low" | "none";
+
+export interface CommitGateEvent {
+    /** Discriminator for the event kind. See header for the four locked values. */
+    eventType:             CommitGateEventType;
+    /** Round number when the event was emitted. 1-indexed. */
+    round:                 number;
+    /** ISO 8601 timestamp. */
+    timestamp:             string;
+    /** Which subsystem produced the event, e.g. "buyer-agent.escalateToHuman". */
+    triggerSource:         string;
+    /** Free-form details for forensic review. Should NOT include PII or secrets. */
+    details:               string;
+    /** Severity per the locked enum. Informational events use "low" or "none". */
+    severity:              CommitGateEventSeverity;
+    /** Whether a future commit-gate posture would have required human approval. */
+    wouldRequireApproval:  boolean;
+}
+
 // Constraint disclosure record — captures what each side disclosed about its
 // private reservation price, and an integrity flag comparing to the
 // known-true demo constant (will go away once the demo is replaced by real
@@ -347,6 +414,18 @@ export interface BuyerNegotiationState {
     ipexInvoice?:       IPEXAuditRecord;    // admitted invoice credential
     ipexDDInvoice?:     IPEXAuditRecord;    // admitted DD invoice credential
     marketSnapshot?:    MarketAuditRecord;  // market data at negotiation time
+
+    // ── Iter 3 (Audit Framework v6) ─────────────────────────────────────────
+    // Declared mandate. Populated in startNegotiation() when the negotiation
+    // was created with `--scenario <id>`. Used by the intent audit block at
+    // deal close. Undefined when the buyer was started via the bare CLI form;
+    // in that case the intent block falls back to AGENT_DEFAULT_CONFIG.
+    scenarioIntent?:    ScenarioIntentExcerpt;
+    // Events that would have fired a human-approval commit gate if one
+    // existed. Emitted into autonomy.commitGate.wouldFireAt[] by the
+    // autonomy audit block. See `CommitGateEvent` interface for the locked
+    // four-value event taxonomy.
+    commitGateEvents?:  CommitGateEvent[];
 }
 
 export interface SellerNegotiationState {
@@ -402,6 +481,19 @@ export interface SellerNegotiationState {
     ipexInvoice?:       IPEXAuditRecord;    // issued/granted invoice credential
     ipexDDInvoice?:     IPEXAuditRecord;    // issued/granted DD invoice credential
     marketSnapshot?:    MarketAuditRecord;  // market data at negotiation time
+
+    // ── Iter 3 (Audit Framework v6) ─────────────────────────────────────────
+    // Mandate received from the buyer on its first OFFER. Audit-only —
+    // the seller does NOT use this to drive behavior. Captured in
+    // handleBuyerOffer when OfferData.scenarioIntent is present. Undefined
+    // when the buyer used the bare CLI form (no scenario), in which case
+    // the seller's intent audit block falls back to AGENT_DEFAULT_CONFIG
+    // derived from its SELLER_CONFIG.
+    receivedScenarioIntent?: ScenarioIntentExcerpt;
+    // Events that would have fired a human-approval commit gate if one
+    // existed. Same semantics as the buyer-side field; populated by
+    // applyTreasuryConstraint and L2's runL2Path when treasury vetoes.
+    commitGateEvents?:  CommitGateEvent[];
 }
 
 // ================= DECISION MAKING =================
