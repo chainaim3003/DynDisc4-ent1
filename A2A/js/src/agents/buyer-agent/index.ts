@@ -178,6 +178,26 @@ class BuyerAgentExecutor implements AgentExecutor {
   private decisionTrail    = new Map<string, DecisionTrailEntry[]>();
   private disclosedBySeller = new Map<string, { value: number; receivedAt: string; note?: string }>();
 
+  // Audit Framework v6 — Iteration 5: per-negotiation LLM-call telemetry.
+  // Each entry is the audit-shaped slice returned by shared/llm-client.ts
+  // for one Gemini call (model + tokens + estimatedCostUSD). Pushed in
+  // getLLMDecision, read by logger.saveAuditJson at deal close to build
+  // frameworkMetrics.cost on the buyer side. Mirrors the seller's
+  // thinkCycleTrace[].steps[stepName=geminiCall] telemetry, which the
+  // seller's logger walks directly; buyer doesn't have a thinkCycleTrace
+  // (seller-only per iter-4 Item 1), so this is the equivalent accumulator.
+  //
+  // Lazy-initialized on first push (no startNegotiation hook needed). A
+  // deal that closes without any buyer LLM call (seller ACCEPT on opening
+  // offer) leaves the map entry undefined; aggregateCostFromLlmCallRecords
+  // handles undefined honestly and emits totalCostUSD = 0 per Item 0.
+  private llmAuditRecords = new Map<string, Array<{
+    modelRequested:    string;
+    promptTokens?:     number;
+    completionTokens?: number;
+    estimatedCostUSD?: number;
+  }>>();
+
   constructor() {
     this.llmClient = new LLMNegotiationClient();
   }
@@ -900,6 +920,9 @@ class BuyerAgentExecutor implements AgentExecutor {
         sellerFinalOffer,
         gap,
       },
+      // Audit Framework v6 — Iteration 5: buyer-side LLM-cost telemetry,
+      // aggregated by logger.saveAuditJson into frameworkMetrics.cost.
+      llmAuditRecords: this.llmAuditRecords.get(state.negotiationId),
     });
     logInternal(`[audit] JSON written (rejection-as-escalation): ${auditPathEsc}`);
 
@@ -1035,6 +1058,9 @@ class BuyerAgentExecutor implements AgentExecutor {
       // Iteration 4 — decision trail + constraint disclosure
       decisions:           this.decisionTrail.get(state.negotiationId) as unknown as Record<string, unknown>[],
       constraintDisclosure: this.buildBuyerConstraintDisclosure(state.negotiationId) as unknown as Record<string, unknown>,
+      // Audit Framework v6 — Iteration 5: buyer-side LLM-cost telemetry,
+      // aggregated by logger.saveAuditJson into frameworkMetrics.cost.
+      llmAuditRecords: this.llmAuditRecords.get(state.negotiationId),
     });
     logInternal(`[audit] JSON written: ${auditPath}`);
 
@@ -1169,6 +1195,9 @@ class BuyerAgentExecutor implements AgentExecutor {
         // Iteration 4 — decision trail + constraint disclosure
         decisions:           this.decisionTrail.get(state.negotiationId) as unknown as Record<string, unknown>[],
         constraintDisclosure: this.buildBuyerConstraintDisclosure(state.negotiationId) as unknown as Record<string, unknown>,
+        // Audit Framework v6 — Iteration 5: buyer-side LLM-cost telemetry,
+        // aggregated by logger.saveAuditJson into frameworkMetrics.cost.
+        llmAuditRecords: this.llmAuditRecords.get(state.negotiationId),
       });
       logInternal(`[audit] JSON written: ${auditPath2}`);
 
@@ -1643,6 +1672,9 @@ class BuyerAgentExecutor implements AgentExecutor {
       extras: {
         buyerFinalOffer, sellerFinalOffer, gap,
       },
+      // Audit Framework v6 — Iteration 5: buyer-side LLM-cost telemetry,
+      // aggregated by logger.saveAuditJson into frameworkMetrics.cost.
+      llmAuditRecords: this.llmAuditRecords.get(state.negotiationId),
     });
     logInternal(`[audit] JSON written (escalation): ${auditPathEsc}`);
 
@@ -1760,6 +1792,23 @@ class BuyerAgentExecutor implements AgentExecutor {
       },
     };
     const r = await this.llmClient.getNegotiationDecision(context);
+
+    // Audit Framework v6 — Iteration 5: accumulate per-negotiation LLM-call
+    // telemetry so logger.saveAuditJson can build frameworkMetrics.cost on
+    // the buyer side. r.audit is present on every path (GEMINI_OK and all
+    // four fallback paths) per llm-client.ts; on fallback paths estimatedCostUSD
+    // is 0, contributing nothing to the total — honest accounting (Item 0).
+    if (r.audit) {
+      const records = this.llmAuditRecords.get(state.negotiationId) ?? [];
+      records.push({
+        modelRequested:   r.audit.modelRequested,
+        promptTokens:     r.audit.promptTokens,
+        completionTokens: r.audit.completionTokens,
+        estimatedCostUSD: r.audit.estimatedCostUSD,
+      });
+      this.llmAuditRecords.set(state.negotiationId, records);
+    }
+
     return { action: r.action, price: r.price, reasoning: r.reasoning };
   }
 

@@ -46,6 +46,7 @@ import {
 } from "../../shared/negotiation-types.js";
 
 import { LLMNegotiationClient, LLMPromptContext } from "../../shared/llm-client.js";
+import type { LLMResponseWithAudit } from "../../shared/llm-client.js";
 import { NegotiationLogger, logInternal, suppressSDKNoise } from "../../shared/logger.js";
 import { SSEBroadcaster } from "../../shared/sse-broadcaster.js";
 
@@ -93,6 +94,16 @@ import type { SigningMode } from "../../messaging/signed-message.js";
 import type { ScenarioIntentExcerpt, SellerIntent, Situation } from "../../shared/intent-types.js";
 import type { CommitGateEvent } from "../../shared/negotiation-types.js";
 import type { ActualOutcomeFacts } from "../../shared/audit-blocks/intent-block.js";
+
+// ============================================================================
+// Audit Framework v6 — Iteration 4 imports.
+// Type-only — the builders are invoked inside logger.saveAuditJson(); this
+// agent just normalizes its accumulated per-round state into the shapes
+// these types describe and passes them through via buildIter4AuditParams().
+// See AUDIT-FRAMEWORK-V6-DECISIONS.md addendum 2026-05-25.
+// ============================================================================
+import type { ThinkCycleRoundInputs } from "../../shared/audit-blocks/think-cycle-trace.js";
+import type { DelegationStepInputs } from "../../shared/audit-blocks/delegation-chain.js";
 
 // ── Iteration 15: notifications (UI dashboard + WhatsApp via Meta Cloud API) ─
 // Same surface as buyer-agent. Seller code never sees a phone number; it
@@ -198,6 +209,14 @@ class SellerAgentExecutor implements AgentExecutor {
   // REJECTED/ESCALATED states.
   private l2BundleByRound    = new Map<string, ConsultationBundle[]>();
   private l2DecisionsByRound = new Map<string, L2ExecutiveDecision[]>();
+
+  // Audit Framework v6 — Iteration 4: per-negotiation LLM call telemetry.
+  // Captured per (negotiationId, round) so thinkCycleTrace[] step 4 has the
+  // gen_ai.* fields + prompt.{hash,text}. Populated by recordLlmAudit() from
+  // BOTH the legacy path (getLLMDecision) and L2 path (runL2Path). Same
+  // leak/cleanup pattern as the L2 maps above; cleanup deferred to a future
+  // iteration along with the L2 maps' cleanup.
+  private llmAuditByRound = new Map<string, Map<number, NonNullable<LLMResponseWithAudit["audit"]>>>();
 
   constructor() {
     this.llmClient   = new LLMNegotiationClient();
@@ -348,6 +367,242 @@ class SellerAgentExecutor implements AgentExecutor {
     if (!state) return;
     if (!state.commitGateEvents) state.commitGateEvents = [];
     state.commitGateEvents.push(ev);
+  }
+
+  // ===========================================================================
+  // Audit Framework v6 — Iteration 4 helpers.
+  // - recordLlmAudit: capture per-round LLM call telemetry for thinkCycleTrace
+  //   step 4. Called from BOTH paths so the audit-block builder has uniform
+  //   inputs regardless of which mode the seller ran in.
+  // - buildIter4AuditParams: normalize accumulated per-round state
+  //   (decisionTrail, l2BundleByRound, l2DecisionsByRound, llmAuditByRound,
+  //   state.lastTreasuryResult) into the ThinkCycleRoundInputs[] +
+  //   DelegationStepInputs[] shapes logger.saveAuditJson expects.
+  //
+  // Mode honesty (DECISIONS Q-iter4-A option (b)):
+  //   - L2_EXECUTIVE_REASONER+: all 5 think-cycle steps populated; 6 delegation
+  //     entries per round.
+  //   - BASIC_SALES_QUOTING_1 / L1_DELEGATED_ADVISORS: only steps 4 + 5
+  //     populated (geminiCall + guardrails); 1 delegation entry per round
+  //     (treasury-consultation — the one sub-agent BASIC calls).
+  // ===========================================================================
+
+  private recordLlmAudit(
+    negotiationId: string,
+    round: number,
+    audit: NonNullable<LLMResponseWithAudit["audit"]>,
+  ): void {
+    let inner = this.llmAuditByRound.get(negotiationId);
+    if (!inner) {
+      inner = new Map<number, NonNullable<LLMResponseWithAudit["audit"]>>();
+      this.llmAuditByRound.set(negotiationId, inner);
+    }
+    inner.set(round, audit);
+  }
+
+  private buildIter4AuditParams(negotiationId: string): {
+    thinkCycleRounds: ThinkCycleRoundInputs[];
+    delegationSteps:  DelegationStepInputs[];
+  } {
+    const state     = this.negotiations.get(negotiationId);
+    const trail     = this.decisionTrail.get(negotiationId)       ?? [];
+    const bundles   = this.l2BundleByRound.get(negotiationId)     ?? [];
+    const l2decs    = this.l2DecisionsByRound.get(negotiationId)  ?? [];
+    const llmAudits = this.llmAuditByRound.get(negotiationId);
+    const mode      = resolveSellerResponseMode();
+    const isL2      = this.resolvedCap.llmExecutiveJudgment;
+
+    const thinkCycleRounds: ThinkCycleRoundInputs[] = [];
+    const delegationSteps:  DelegationStepInputs[]  = [];
+
+    // Per-round walk. Both paths push exactly one decisionTrail entry per
+    // round so len(trail) is authoritative. bundles[i] / l2decs[i] only
+    // exist when L2 ran.
+    for (let i = 0; i < trail.length; i++) {
+      const entry  = trail[i];
+      const round  = entry.round;
+      const audit  = llmAudits?.get(round);
+      const bundle = isL2 ? bundles[i] : undefined;
+      const l2dec  = isL2 ? l2decs[i]  : undefined;
+
+      // ── thinkCycleTrace[] per-round inputs ──────────────────────────────
+      const r: ThinkCycleRoundInputs = { round, mode };
+
+      if (isL2) {
+        r.step1_receiveOffer = {
+          incomingOffer:   entry.incomingOffer ?? 0,
+          timestamp:       entry.timestamp,
+          lastSellerOffer: state?.lastSellerOffer,
+          historyLength:   state?.history.length,
+        };
+        if (bundle) {
+          const advisorsCalled: string[] = [];
+          const advisorOutcomes: Record<string, { success: boolean; note?: string }> = {};
+          if (bundle.treasury)  { advisorsCalled.push("treasury");  advisorOutcomes.treasury  = { success: !!bundle.treasury.success  }; }
+          if (bundle.inventory) { advisorsCalled.push("inventory"); advisorOutcomes.inventory = { success: !!bundle.inventory.success }; }
+          if (bundle.logistics) { advisorsCalled.push("logistics"); advisorOutcomes.logistics = { success: !!bundle.logistics.success }; }
+          if (bundle.credit)    { advisorsCalled.push("credit");    advisorOutcomes.credit    = { success: !!bundle.credit.success    }; }
+          r.step2_advisorConsultation = {
+            advisorsCalled,
+            advisorOutcomes,
+            routerLatencyMs: bundle.routerLatencyMs,
+          };
+        }
+        r.step3_mathAggregator = {
+          tacticsTrace: l2dec?.tacticsTrace as unknown as Record<string, unknown> | undefined,
+        };
+      }
+      // BASIC/L1: steps 1–3 deliberately absent per Q-iter4-A option (b).
+
+      if (audit) {
+        r.step4_geminiCall = { llmAudit: audit };
+      }
+
+      r.step5_guardrails = {
+        llmProposed: {
+          action: entry.llmProposal?.action ?? "UNKNOWN",
+          price:  entry.llmProposal?.price,
+        },
+        finalAfterGuardrails: {
+          action: entry.finalDecision?.action ?? "UNKNOWN",
+          price:  entry.finalDecision?.price,
+        },
+        overrideApplied: entry.constraintAdjustment !== undefined || entry.treasuryOverride !== undefined,
+        overrideReason:  entry.constraintAdjustment?.reasoning,
+        overrideSource:  entry.constraintAdjustment ? "applySellerConstraints"
+                       : entry.treasuryOverride    ? "treasuryConstraint"
+                       : undefined,
+        defensiveActions: l2dec?.defensiveActions as unknown as Array<Record<string, unknown>> | undefined,
+      };
+
+      thinkCycleRounds.push(r);
+
+      // ── delegationChain[] per-round entries ─────────────────────────────
+      if (isL2) {
+        // 6 entries per round in canonical order. authorityEnvelope.limits
+        // is conservative: only fields actually known at this layer.
+        delegationSteps.push({
+          round, stepName: "treasury-consultation",
+          decidedBy:     "JupiterTreasuryAgent",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "Treasury validates ACTUS PAM cashflow + NPV + safety threshold",
+            limits:      { paymentTermsDays: SELLER_CONFIG.dd.paymentTermsDays },
+          },
+          outcome: {
+            success: !!bundle?.treasury?.success,
+            result:  bundle?.treasury?.result as unknown,
+          },
+          rationale: "Validate cash position + profitability at the proposed price",
+        });
+        delegationSteps.push({
+          round, stepName: "inventory-consultation",
+          decidedBy:     "InventoryProvider",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "Inventory provides stock + production-capacity signal",
+            limits:      {},
+          },
+          outcome: {
+            success: !!bundle?.inventory?.success,
+            result:  bundle?.inventory?.result as unknown,
+          },
+          rationale: "Confirm fulfillment capacity at the proposed quantity",
+        });
+        delegationSteps.push({
+          round, stepName: "logistics-consultation",
+          decidedBy:     "LogisticsProvider",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "Logistics provides shipping cost + delivery-feasibility signal",
+            limits:      {},
+          },
+          outcome: {
+            success: !!bundle?.logistics?.success,
+            result:  bundle?.logistics?.result as unknown,
+          },
+          rationale: "Confirm shipping feasibility for the destination",
+        });
+        delegationSteps.push({
+          round, stepName: "credit-consultation",
+          decidedBy:     "CreditProvider",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "Credit provides buyer-side payment-risk signal",
+            limits:      {},
+          },
+          outcome: {
+            success: !!bundle?.credit?.success,
+            result:  bundle?.credit?.result as unknown,
+          },
+          rationale: "Assess counterparty payment risk before commit",
+        });
+        delegationSteps.push({
+          round, stepName: "executive-synthesis",
+          decidedBy:     "seller-agent.l2-executive",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "L2 executive reasoner aggregates advisor outputs + applies math-aggregator floor",
+            limits:      { marginPrice: SELLER_CONFIG.marginPrice, minProfitMargin: SELLER_CONFIG.strategyParams.minProfitMargin },
+          },
+          outcome: {
+            action:               l2dec?.action,
+            counterPrice:         l2dec?.counterPrice,
+            mathOverrideApplied:  l2dec?.mathOverride !== undefined,
+            defensiveActionCount: l2dec?.defensiveActions?.length ?? 0,
+          },
+          rationale: l2dec?.reasoning ?? "L2 executive synthesis",
+        });
+        delegationSteps.push({
+          round, stepName: "consultation-routing",
+          decidedBy:     "seller-agent.consultation-router",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "M2-beta router selects which advisors to call for this mode + round",
+            limits:      { mode },
+          },
+          outcome: {
+            routerMode:      bundle?.mode,
+            routerLatencyMs: bundle?.routerLatencyMs,
+            advisorsCalled: [
+              bundle?.treasury  ? "treasury"  : null,
+              bundle?.inventory ? "inventory" : null,
+              bundle?.logistics ? "logistics" : null,
+              bundle?.credit    ? "credit"    : null,
+            ].filter((x): x is string => x !== null),
+          },
+          rationale: "Route per mode capabilities resolved at agent construction",
+        });
+      } else {
+        // BASIC/L1: only treasury-consultation per round (Q-iter4-A option (b)).
+        // The other 5 step names don't structurally exist in BASIC mode —
+        // there is no advisor pipeline, no math aggregator, no executive
+        // synthesis, no consultation router. Emitting empty entries for them
+        // would fabricate structure (DECISIONS Item 0).
+        const tx = entry.treasuryOverride;
+        delegationSteps.push({
+          round, stepName: "treasury-consultation",
+          decidedBy:     "JupiterTreasuryAgent",
+          onAuthorityOf: "Chief Audit Officer",
+          authorityEnvelope: {
+            description: "Treasury validates ACTUS PAM cashflow + NPV + safety threshold",
+            limits:      { paymentTermsDays: SELLER_CONFIG.dd.paymentTermsDays },
+          },
+          outcome: tx ? {
+            approved:        tx.approved,
+            npvOfDeal:       tx.npvOfDeal,
+            netProfit:       tx.netProfit,
+            minViablePrice:  tx.minViablePrice,
+            failReasons:     tx.failReasons,
+          } : {
+            note: "Treasury not consulted this round (treasury disabled, unreachable, or timed out)",
+          },
+          rationale: "Validate cash position + profitability at the proposed price (only sub-agent BASIC mode calls)",
+        });
+      }
+    }
+
+    return { thinkCycleRounds, delegationSteps };
   }
 
   async cancelTask(taskId: string): Promise<void> {
@@ -701,6 +956,18 @@ class SellerAgentExecutor implements AgentExecutor {
     const decisions = this.l2DecisionsByRound.get(state.negotiationId) ?? [];
     decisions.push(out.l2Decision);
     this.l2DecisionsByRound.set(state.negotiationId, decisions);
+
+    // Iter 4 (Audit Framework v6): also capture llmAudit from the L2 decision
+    // so thinkCycleTrace[] step 4 has uniform inputs across legacy + L2 paths.
+    // L2's llmAudit comes from the same LLMNegotiationClient.getNegotiationDecision
+    // call as the legacy path, just one extra layer in.
+    if (out.l2Decision.llmAudit) {
+      this.recordLlmAudit(
+        state.negotiationId,
+        round,
+        out.l2Decision.llmAudit as NonNullable<LLMResponseWithAudit["audit"]>,
+      );
+    }
 
     // ── Update state.lastTreasuryResult so success-report code stays sane ──
     if (out.treasurySummary) {
@@ -1236,6 +1503,7 @@ class SellerAgentExecutor implements AgentExecutor {
         finalProduct:  state.productCode,
         roundsUsed:    state.currentRound,
       }),
+      ...this.buildIter4AuditParams(state.negotiationId),
       outcome:         "escalation",
       finalPrice:      Math.round((buyerFinalOffer + sellerFinalOffer) / 2),
       quantity:        state.quantity,
@@ -1363,6 +1631,7 @@ class SellerAgentExecutor implements AgentExecutor {
           finalProduct:  state.productCode,
           roundsUsed:    data.round,
         }) : {}),
+        ...(state ? this.buildIter4AuditParams(state.negotiationId) : {}),
         outcome:         "escalation",
         finalPrice:      Math.round((data.buyerFinalOffer + data.sellerFinalOffer) / 2),
         quantity:        state?.quantity ?? 0,
@@ -1568,6 +1837,7 @@ class SellerAgentExecutor implements AgentExecutor {
         finalProduct:  state.productCode,
         roundsUsed:    state.currentRound,
       }),
+      ...this.buildIter4AuditParams(state.negotiationId),
       outcome:         "success",
       finalPrice:      data.acceptedPrice,
       quantity:        state.quantity,
@@ -2047,6 +2317,13 @@ class SellerAgentExecutor implements AgentExecutor {
       },
     };
     const llmResponse = await this.llmClient.getNegotiationDecision(context);
+    // Iter 4 (Audit Framework v6): capture LLM call telemetry per round for
+    // thinkCycleTrace[] step 4. Both success and fallback paths populate
+    // llmResponse.audit; we record regardless so the audit shows what
+    // happened even on rules-fallback rounds.
+    if (llmResponse.audit) {
+      this.recordLlmAudit(state.negotiationId, state.currentRound, llmResponse.audit);
+    }
     return { action: llmResponse.action, price: llmResponse.price, reasoning: llmResponse.reasoning };
   }
 
