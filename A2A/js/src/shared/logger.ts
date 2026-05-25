@@ -68,6 +68,65 @@ import {
     type HumanOversightPosition,
 } from "./audit-blocks/autonomy-block.js";
 
+// ============================================================================
+// Audit Framework v6 — Iteration 4 imports.
+// thinkCycleTrace[] + delegationChain[] builders. Both blocks are seller-only
+// per DECISIONS Item 1 / Item 4 (the structures don't exist on the buyer).
+// In BASIC/L1 modes, the per-round inputs are partial per Q-iter4-A option (b)
+// — the builders handle the partial-ness natively (omit steps whose inputs
+// are absent; emit only treasury-consultation in delegationChain).
+// Backward-compat: when neither thinkCycleRounds nor delegationSteps is
+// passed, neither block is emitted (iter-3 and earlier callers untouched).
+// ============================================================================
+import {
+    buildThinkCycleTrace,
+    type ThinkCycleRoundInputs,
+    type ThinkCycleTraceBlock,
+} from "./audit-blocks/think-cycle-trace.js";
+import {
+    buildDelegationChain,
+    type DelegationStepInputs,
+    type DelegationChainBlock,
+} from "./audit-blocks/delegation-chain.js";
+
+// ============================================================================
+// Audit Framework v6 — Iteration 5 imports.
+// frameworkMetrics + selfCheck + compliance blocks. All three scoped "both"
+// per DECISIONS iter-5 addendum Item 5. The block builders are pure functions
+// over typed inputs; we extract those inputs from the already-assembled
+// auditDoc just before serialization (Item 6 "deferred to code-edit phase"),
+// so the agents themselves need ZERO changes for selfCheck + compliance.
+//
+// Only frameworkMetrics requires a new caller-side hook: on the BUYER side,
+// LLM-cost telemetry has no thinkCycleTrace to walk, so the buyer agent
+// must accumulate a per-negotiation llmAuditRecords[] and pass it in via
+// the new optional saveAuditJson() param (wired in Step B).
+// ============================================================================
+import { createHash } from "node:crypto";
+import {
+    buildFrameworkMetrics,
+    aggregateSellerCostFromThinkCycleTrace,
+    aggregateCostFromLlmCallRecords,
+    aggregateRiskAvoidedFromCommitGate,
+    extractOutcomeMetrics,
+    type FrameworkMetricsBlock,
+    type FrameworkMetricsCost,
+} from "./audit-blocks/framework-metrics.js";
+import {
+    buildSelfCheck,
+    checkIdentityVerified,
+    checkMessageIntegrityIntact,
+    checkIntentDeclaredAndTracked,
+    checkReasoningAuditable,
+    checkDelegationAttested,
+    type SelfCheckBlock,
+} from "./audit-blocks/self-check.js";
+import {
+    buildCompliance,
+    type ComplianceBlock,
+} from "./audit-blocks/compliance.js";
+import { computeDelegationSignatureValue } from "./audit-blocks/delegation-chain.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
@@ -739,6 +798,49 @@ export class NegotiationLogger {
         commitGateEvents?:         CommitGateEvent[];
         humanOversightPosition?:   HumanOversightPosition;
         guardrails?:               string[];
+        // ====================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 4 inputs.
+        //
+        // thinkCycleTrace[] — per-round 5-step think cycle from FRAMEWORK-V2
+        // §6 (DECISIONS Item 1). Seller-only.
+        //   - thinkCycleRounds: one ThinkCycleRoundInputs per round. The
+        //     CALLER decides which steps to populate; BASIC/L1 mode passes
+        //     only step4+step5 (Q-iter4-A option (b)); L2+ passes all 5.
+        //
+        // delegationChain[] — per-round 6-step delegation chain from v6
+        // App B.2.2 (DECISIONS Item 4). Seller-only.
+        //   - delegationSteps: flat array of DelegationStepInputs across all
+        //     rounds. Caller orders entries by round + canonical step order.
+        //     BASIC mode passes only `treasury-consultation` per round;
+        //     L2+ passes all 6 per round.
+        //
+        // Both params are optional; absence = block not emitted (backward
+        // compat with iter-3 callers, and used by the BUYER audit which
+        // never populates these per Item 1 / Item 4).
+        // ====================================================================
+        thinkCycleRounds?:         ThinkCycleRoundInputs[];
+        delegationSteps?:          DelegationStepInputs[];
+        // ====================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 5 inputs.
+        //
+        // llmAuditRecords[] — BUYER-SIDE LLM-call telemetry. Each record is the
+        // audit-shaped slice returned by shared/llm-client.ts (model name +
+        // token counts + estimatedCostUSD). The buyer-agent accumulates these
+        // per negotiation and passes them in here so frameworkMetrics.cost can
+        // be aggregated. Wired by Step B of the iter-5 plan.
+        //
+        // Seller side does NOT pass this — frameworkMetrics aggregates seller
+        // cost from thinkCycleTrace[].steps[stepName=geminiCall] directly.
+        //
+        // When undefined on the buyer (e.g. pre-Step-B), totalCostUSD = 0
+        // honestly per DECISIONS iter-5 Item 0 ("emit, don't omit").
+        // ====================================================================
+        llmAuditRecords?: Array<{
+            modelRequested:    string;
+            promptTokens?:     number;
+            completionTokens?: number;
+            estimatedCostUSD?: number;
+        }>;
     }): string {
         // v6 Iter1: per-deal folder; mkdir handled inside getDealFolder().
         const dir = getDealFolder(this.negotiationId);
@@ -851,6 +953,22 @@ export class NegotiationLogger {
             });
         }
 
+        // ================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 4: build thinkCycleTrace[] and
+        // delegationChain[]. Both are seller-only; the buyer audit's caller
+        // does not pass thinkCycleRounds or delegationSteps, so both blocks
+        // remain undefined and are not spread into auditDoc.
+        // ================================================================
+        let thinkCycleBlock: ThinkCycleTraceBlock | undefined;
+        if (params.thinkCycleRounds !== undefined) {
+            thinkCycleBlock = buildThinkCycleTrace(params.thinkCycleRounds);
+        }
+
+        let delegationBlock: DelegationChainBlock | undefined;
+        if (params.delegationSteps !== undefined) {
+            delegationBlock = buildDelegationChain(params.delegationSteps);
+        }
+
         const auditDoc = {
             negotiationId:  this.negotiationId,
             perspective:    this.myRole,
@@ -922,6 +1040,15 @@ export class NegotiationLogger {
             // ================================================================
             intent,
             autonomy,
+            // ================================================================
+            // AUDIT FRAMEWORK V6 — Iteration 4 audit blocks.
+            // - thinkCycleTrace[] + thinkCycleTraceScope (Item 1, Item 8)
+            // - delegationChain[] + delegationChainScope (Item 4, Item 8)
+            // Both are seller-only; buyer audits leave them undefined and
+            // they're not spread when undefined (the ...spread pattern).
+            // ================================================================
+            ...(thinkCycleBlock ?? {}),
+            ...(delegationBlock ?? {}),
             negotiation: {
                 roundsUsed:      params.roundsUsed,
                 maxRounds:       params.maxRounds,
@@ -940,7 +1067,94 @@ export class NegotiationLogger {
             logs:     params.logs,
         };
 
-        fs.writeFileSync(filePath, JSON.stringify(auditDoc, null, 2), "utf8");
+        // ================================================================
+        // AUDIT FRAMEWORK V6 — Iteration 5: build frameworkMetrics + selfCheck
+        // + compliance from the already-assembled auditDoc.
+        //
+        // Per DECISIONS iter-5 addendum Item 6, this happens at code-edit
+        // (logger) time, NOT at agent caller time. The agents pass nothing
+        // new for selfCheck or compliance — those blocks are derived purely
+        // from auditDoc fields the agents already populate (identityProof,
+        // messageSigningPosture, messageLog, intent, thinkCycleTrace,
+        // delegationChain, autonomy.commitGate, outcomeQuality).
+        //
+        // The two verifier closures are inline here so self-check.ts can stay
+        // dependency-free (it doesn't import node:crypto or our delegation
+        // signer). The hash verifier (#4) re-hashes prompt.text vs prompt.hash;
+        // the HMAC verifier (#5) re-derives the entry signature via the
+        // canonical computeDelegationSignatureValue() from delegation-chain.ts
+        // and compares against signature.value.
+        //
+        // All three iter-5 blocks are spread into a new `finalDoc` so the
+        // existing auditDoc-driven index-line construction below stays
+        // unchanged. Iter-5 blocks land at the end of the JSON; order is
+        // not part of the locked contract (only field names + scope markers).
+        // ================================================================
+        const verifySha256Hex = (text: string, expectedHex: string): boolean => {
+            const computed = createHash("sha256").update(text).digest("hex");
+            return computed === expectedHex;
+        };
+
+        const verifyDelegationSignature = (entry: Record<string, unknown>): boolean => {
+            const sig = entry["signature"] as { value?: string } | undefined;
+            if (!sig?.value) return false;
+            // Strip signature from a shallow copy, re-derive via the canonical
+            // signer, compare. The builder uses insertion-order JSON.stringify
+            // for the hash (delegation-chain.ts comment on signing convention),
+            // and the destructure-then-spread pattern preserves that order on
+            // the round-trip.
+            const { signature: _sig, ...entryMinusSignature } = entry as any;
+            try {
+                const expected = computeDelegationSignatureValue(entryMinusSignature);
+                return expected === sig.value;
+            } catch {
+                return false;
+            }
+        };
+
+        const auditAny = auditDoc as any;
+
+        // selfCheck — 5 booleans, derived per DECISIONS iter-5 Item 2.
+        // Seller-only checks (#4, #5) are forced to null on the buyer side by
+        // the builder regardless of what we pass; we pass the honest computed
+        // values anyway so a future cross-side audit can introspect.
+        const selfCheck: SelfCheckBlock = buildSelfCheck({
+            perspective: this.myRole,
+            checks: {
+                identityVerified:         checkIdentityVerified(auditAny),
+                messageIntegrityIntact:   checkMessageIntegrityIntact(auditAny),
+                intentDeclaredAndTracked: checkIntentDeclaredAndTracked(auditAny),
+                reasoningAuditable:       checkReasoningAuditable(auditAny, this.myRole, verifySha256Hex),
+                delegationAttested:       checkDelegationAttested(auditAny, this.myRole, verifyDelegationSignature),
+            },
+        });
+
+        // frameworkMetrics — cost source switches on perspective.
+        //   SELLER: walk thinkCycleTrace[].steps (iter-4 telemetry, already there).
+        //   BUYER:  use the caller-supplied llmAuditRecords[] (Step B). When
+        //           that param is undefined, totalCostUSD = 0 honestly.
+        const cost: FrameworkMetricsCost = (this.myRole === "SELLER")
+            ? aggregateSellerCostFromThinkCycleTrace(auditAny.thinkCycleTrace)
+            : aggregateCostFromLlmCallRecords(params.llmAuditRecords);
+        const outcome     = extractOutcomeMetrics(auditAny, this.myRole);
+        const riskAvoided = aggregateRiskAvoidedFromCommitGate(auditAny.autonomy?.commitGate);
+        const frameworkMetrics: FrameworkMetricsBlock = buildFrameworkMetrics({
+            cost,
+            outcome,
+            riskAvoided,
+        });
+
+        // compliance — static crosswalk (DECISIONS iter-5 Item 4).
+        const compliance: ComplianceBlock = buildCompliance();
+
+        const finalDoc = {
+            ...auditDoc,
+            frameworkMetrics,
+            selfCheck,
+            compliance,
+        };
+
+        fs.writeFileSync(filePath, JSON.stringify(finalDoc, null, 2), "utf8");
 
         // Iter 2: free the in-memory message log for this negotiation now
         // that its content is durable on disk inside auditDoc.messageLog[].

@@ -315,6 +315,543 @@ seller-intent NOT driving seller behavior **remains accurate**.
 - `commitGate.state` runtime value — remains `"NOT_REQUIRED"` until a real commit gate is built (post-MVP).
 - `learningFromOutcome` pillar — remains `false` until L4 ships.
 
+### 2026-05-25 — Notes addendum: Iter 4 vocabulary lock (reasoning + delegation chain)
+
+Iter 4 emits two new audit blocks: `thinkCycleTrace[]` and
+`delegationChain[]`. PLAN Iter 4 §Scope locks the **structure** at a
+high level. DECISIONS.md Q8 / Q10 / Q31 lock partial vocabulary. This
+addendum locks the remaining vocabulary plus the **scoping philosophy**
+under which iter 4 ships.
+
+Nothing in this addendum changes the locked value column for any prior
+Q. It supplies the field-level vocabulary that iter 4 encodes and the
+honest-current-state scoping that governs what gets emitted vs deferred.
+
+#### Item 0 — Core philosophy: honest partial > misleading complete
+
+The audit must capture only what the system can honestly observe,
+verify, and attest to today. Concretely, iter 4 honors all of:
+
+- If a referenced paper or specification is inaccessible at iter-4 time,
+  do not guess missing schema fields. Lock what's reachable; defer the
+  rest with an explicit deferred-reason marker.
+- If an agent does not have a real multi-step reasoning pipeline, do
+  not force one onto it. Emit the block only on the agent where the
+  structure is genuine.
+- If the system does not yet support a compliance capability (e.g. human
+  override or intervention), do not pretend it does. The relevant
+  attribute is `false`, not silently omitted.
+- If the LLM SDK does not return a telemetry field, do not emit a null
+  for it. **Missing by design ≠ missing by failure.** Omit the key.
+
+This philosophy governs every other item below. Where a tension exists
+between schema completeness and honesty, honesty wins.
+
+#### Item 1 — `thinkCycleTrace[]` scope and the 5 step names (Q4-1)
+
+`thinkCycleTrace[]` is emitted on the **seller audit only**. The buyer
+agent has no advisor pipeline, no math aggregator, and no tier-gated
+prompt structure; forcing a 5-step shape on it would fabricate
+structure that doesn't exist (Item 0).
+
+Locked step names and ordering, sourced verbatim from FRAMEWORK-V2 §6
+("The five-step seller-response-thinking-iteration"):
+
+| # | stepName              | What runs in this step                                                  |
+|---|-----------------------|-------------------------------------------------------------------------|
+| 1 | `receiveOffer`        | Receive the buyer's offer envelope; load negotiation state              |
+| 2 | `advisorConsultation` | Decide which advisors to consult; call them in parallel                 |
+| 3 | `mathAggregator`      | Run `ADVISOR_MATH_AGGREGATOR` (effective floor, NBS, utility)           |
+| 4 | `geminiCall`          | Build the tier-appropriate prompt; call Gemini                          |
+| 5 | `guardrails`          | Apply tier-appropriate guardrails to Gemini's output → final decision   |
+
+One `thinkCycleTrace[]` entry per round. Each entry has shape:
+
+```json
+{
+  "round": <int>,
+  "steps": [
+    { "stepNumber": 1, "stepName": "receiveOffer",        ...step-1 observable output... },
+    { "stepNumber": 2, "stepName": "advisorConsultation", ...step-2 observable output... },
+    { "stepNumber": 3, "stepName": "mathAggregator",      ...step-3 observable output... },
+    { "stepNumber": 4, "stepName": "geminiCall",          ...step-4 fields per Item 2... },
+    { "stepNumber": 5, "stepName": "guardrails",          ...step-5 observable output... }
+  ]
+}
+```
+
+Steps 1–3 and 5: each carries only the fields that are observable from
+what that step actually computes. No standard subset is forced. (The
+shape is implementation-driven, not schema-driven, per Item 0.)
+
+#### Item 2 — `gen_ai.*` field policy and placement (Q4-6, Follow-on A)
+
+`gen_ai.*` keys appear **only on step 4** of each `thinkCycleTrace[]`
+entry (the `geminiCall` step). Steps 1, 2, 3, 5 do not carry `gen_ai.*`
+keys — there is no LLM call there, so the field family doesn't apply.
+
+Field set on step 4: the **honest superset of what the Gemini SDK
+actually returns**, named per [OTEL-GENAI-SEMCONV]. A field is emitted
+only when the SDK produces a value for it. Examples likely present:
+
+- `gen_ai.system` (`"gemini"`)
+- `gen_ai.request.model`
+- `gen_ai.response.id`
+- `gen_ai.response.finish_reasons`
+- `gen_ai.usage.input_tokens`
+- `gen_ai.usage.output_tokens`
+
+Plus, on step 4 only:
+
+- `prompt.hash`  — sha256 of the prompt text, always emitted
+- `prompt.text`  — verbatim prompt text, emitted per Item 3's config flag
+
+Fields the SDK does not return are **omitted from the JSON**, not
+written as `null`. (Item 0.)
+
+#### Item 3 — `prompt.text` config flag (Q4-7, Follow-on B)
+
+A config flag controls whether `prompt.text` is written into the audit.
+
+- **Flag name:** `auditConfig.includePromptText`
+- **Default value (iter 4):** `true`
+- **When `true`:** step 4 emits both `prompt.hash` and `prompt.text`
+- **When `false`:** step 4 emits only `prompt.hash`; the `prompt.text`
+  key is **omitted entirely**, not written as `null`
+
+The flag's storage location (env var, config file, hardcoded constant)
+is an implementation detail resolved during the iter-4 code-edit phase
+by reading existing project conventions in `shared/`. The **behavior**
+above is locked regardless of where the flag lives.
+
+Acceptance test PLAN T6 ("Audit contains both `prompt.hash` AND
+`prompt.text` (config flag verifiable)") is honored at default. Setting
+the flag to `false` and re-running yields an audit with only
+`prompt.hash` — that's the verifiability path.
+
+#### Item 4 — `delegationChain[]` step vocabulary (Q4-4)
+
+`delegationChain[]` is emitted on the **seller audit only**, for the
+same reason as Item 1: the 6 step names enumerate seller-side
+sub-agents and the seller's executive-synthesis layer. Buyer does not
+have this structure.
+
+Locked step name enum, sourced verbatim from
+`AUDIT-FRAMEWORK-V6-DESIGN.md` Appendix B.2.2:
+
+1. `treasury-consultation`
+2. `inventory-consultation`
+3. `logistics-consultation`
+4. `credit-consultation`
+5. `executive-synthesis`
+6. `consultation-routing`
+
+PLAN T3 ("~18 entries (6 × 3 rounds) for a 3-round deal") is satisfied
+when every round emits all 6 entries in canonical order. Per
+Appendix B.2.2, this enum lives in a config file
+(`@chainaim/audit-framework-procurement/config/delegation-steps.json`
+or equivalent location chosen at code-edit time), not hardcoded in a
+TypeScript enum in the core validator.
+
+#### Item 5 — DCC properties on each delegation entry (Q10 partial)
+
+Q10 locks "YES — all 7 DCC properties." The 7 are sourced from
+[DCC-2026] (Patil, *SentinelAgent*, arXiv 2604.02767, 2026), which is
+not accessible at iter-4 time. Per Item 0, iter 4 does **not** invent
+the missing 3.
+
+Iter 4 emits the **4 properties verifiably sourced from FRAMEWORK-V2 §8**:
+
+1. `decidedBy`         — agent that produced this decision
+2. `onAuthorityOf`     — organizational role under which the decision was made
+3. `authorityEnvelope` — `{ description, limits }` of the role's authority
+4. `signature`         — see Item 7
+
+Plus an explicit deferred-state marker block per entry:
+
+```json
+"dcc": {
+  "propertiesEmitted":   4,
+  "propertiesFullSpec":  7,
+  "spec":                "FRAMEWORK-V2 §8 (4 of 7)",
+  "deferredReason":      "[DCC-2026] Patil arxiv 2604.02767 not accessible at iter-4 lock time (2026-05-25). Remaining 3 properties to be added in a future addendum once the spec is read."
+}
+```
+
+When the [DCC-2026] spec becomes accessible, a future addendum locks the
+remaining 3 properties and removes the deferred marker. Q10's locked
+value column in the main table is unchanged.
+
+#### Item 6 — EU AI Act Article 14 attributes per delegation entry (Q4-3)
+
+Closed set per delegation entry: **the 4 booleans named in PLAN Iter 4
+T5**, no more. The full Article 14 attribute set is larger as a
+regulation but the values for those additional attributes cannot be
+honestly stated until the code supports the underlying capabilities
+(intervention paths, override paths, etc).
+
+Locked attribute set today:
+
+| Attribute              | Current state value | Why |
+|------------------------|---------------------|-----|
+| `monitorability`       | `true`              | Live agent state observable via existing `/api/self/*` endpoints |
+| `traceability`         | `true`              | `messageLog[]` (iter 2) + `decisionTrail` capture every message and decision |
+| `interventionPossible` | `false`             | No mid-deal pause/intervene endpoint exists in current code |
+| `overridePossible`     | `false`             | No human-override endpoint exists; `commitGate.state` is always `NOT_REQUIRED` (iter-3 addendum) |
+
+Per-entry shape:
+
+```json
+"euAiActArticle14": {
+  "monitorability":       true,
+  "traceability":         true,
+  "interventionPossible": false,
+  "overridePossible":     false,
+  "attributesEmitted":    4,
+  "note":                 "Honest current-state booleans per ITERATION-PLAN Iter 4 T5. Article 14 as a regulation defines additional attributes; those are deferred until the code supports intervention and override paths."
+}
+```
+
+When intervention/override paths ship in a future iteration, those
+booleans flip and additional Article 14 attributes can be added in a
+future addendum.
+
+#### Item 7 — `decisionAttestation` signature target and signer (Q4-5)
+
+Each delegation entry's `signature` field is structured per FRAMEWORK-V2
+§8:
+
+```json
+"signature": {
+  "kind":     "HMAC",
+  "value":    "<hex-encoded signature output>",
+  "signedAt": "<ISO 8601 UTC timestamp>"
+}
+```
+
+- **kind** today: `"HMAC"`. (Future tiers per V2 §8: `vLEI-OOR-credential`,
+  `vLEI-LE-credential` — out of scope per PLAN Part 7.)
+- **Signer:** the existing `PlainHashSigner` (= `messageSigningPosture.tier`
+  value `HASH_ENVELOPE` per iter-2 addendum). No new signer in iter 4.
+- **Signed value (`value` field):** the output of
+  `PlainHashSigner.sign( sha256( canonicalJSON(entry-minus-`signature`) ) )`,
+  where `canonicalJSON` is sorted-key, no-whitespace JSON serialization of
+  the delegation entry with the `signature` field excluded. The exact
+  canonicalization helper is an implementation detail resolved at
+  code-edit time by reusing whatever the iter-2 message-log signer
+  already uses.
+
+What this means in practice: every field of the delegation entry —
+`stepName`, `decidedBy`, `onAuthorityOf`, `authorityEnvelope`,
+`outcome`, `rationale`, `dcc.*`, `euAiActArticle14.*`, `signedAt` —
+is covered by the signature. Mutating any of them invalidates the
+signature. The `signature` field itself is excluded from its own
+target (avoids the self-reference cycle).
+
+T4 ("Has valid `decisionAttestation` signature (verifies with
+MessageSigner)") is verified by passing each entry through the same
+helper in the opposite direction.
+
+#### Item 8 — Honesty markers as first-class schema (cross-cutting)
+
+Per Item 0, every place iter 4 ships a partial implementation carries
+a self-describing marker in the audit JSON so a reader can see the
+partial-ness without external context. Locked marker fields:
+
+- On each `delegationChain[]` entry: `dcc.propertiesEmitted`,
+  `dcc.propertiesFullSpec`, `dcc.deferredReason` (Item 5)
+- On each `delegationChain[]` entry: `euAiActArticle14.attributesEmitted`,
+  `euAiActArticle14.note` (Item 6)
+- At the top of `thinkCycleTrace[]` array (sibling field):
+  `thinkCycleTraceScope: "seller-only"` so a reader doesn't ask
+  "where's the buyer's?" (Item 1)
+- At the top of `delegationChain[]` array (sibling field):
+  `delegationChainScope: "seller-only"` for the same reason (Item 4)
+
+These markers are append-only. Future iterations that expand a partial
+implementation update the marker (e.g. `propertiesEmitted: 4 → 7`) and
+add a corresponding addendum entry to this file.
+
+#### What this addendum does NOT change
+
+- **Q8** locked value (Gemini prompt storage hash+text now; config flag
+  flips to hash-only later) — Item 3 implements this behavior verbatim.
+- **Q10** locked value column (`DCC per delegation entry: YES — all 7
+  properties`) — Item 5 ships 4-of-7 with an explicit deferred marker;
+  the locked target remains 7.
+- **Q31** locked value (discriminator placement: Option A, sibling
+  fields next to `outcome`) — unchanged.
+- **Q32** locked value (`commitGate.state` enum: all 8 values) — unchanged;
+  `commitGate` runtime state remains `"NOT_REQUIRED"` per iter-3 addendum
+  Item 5.
+- The buyer audit. Iter 4 does not modify the buyer audit shape. Buyer
+  retains its iter-3 state. (Item 1 / Item 4 scoping.)
+- `shared/llm-client.ts` instrumentation captures LLM call telemetry
+  for **every** caller (buyer or seller) so the same client serves both.
+  But only the seller-side audit consumer reads from that telemetry
+  buffer in iter 4. Whether the buyer audit later surfaces its own
+  LLM-call records is out of scope here.
+
+#### What's deferred to the iter-4 code-edit phase (not locked here)
+
+The following are implementation choices that are resolved by reading
+existing project code/conventions during the iter-4 file/edit plan, not
+by this addendum:
+
+- **Q4-7 specifics:** the exact storage location for
+  `auditConfig.includePromptText` (env var name, config module path, or
+  hardcoded constant location). Behavior in Item 3 is locked regardless.
+- **Q4-8:** the relationship between the new `thinkCycleTrace[]` /
+  `delegationChain[]` and the existing in-state `decisionTrail`
+  accumulator (iter-3 addendum Item 5 referenced this). Resolved by
+  reading `agents/seller-agent/index.ts` at code-edit time. Default
+  intent: both new blocks are additive; `decisionTrail` is untouched.
+- The exact canonical-JSON helper to use for Item 7's signature target.
+- The on-disk location of the `delegation-steps.json` config file
+  (Item 4) — `packages/audit-framework-procurement/config/` is the
+  intent per v6 Appendix B.2.2 but the actual workspace path is
+  resolved at code-edit time.
+
+### 2026-05-25 — Notes addendum: Iter 5 vocabulary lock (economics + self-check + compliance)
+
+Iter 5 emits three new audit blocks on **both** the buyer audit and the
+seller audit: `frameworkMetrics`, `selfCheck`, and `compliance`. Q6
+already locks the four `selfCheck.overallVerdict` values. This addendum
+locks the remaining vocabulary (the 5 boolean check names, the metric
+schema, the compliance crosswalk schema, the verdict derivation rule,
+and the per-block scope markers) and restates the honest-partial
+philosophy from the iter-4 addendum so iter-5 honors it consistently.
+
+Nothing in this addendum changes the locked-value column for any prior
+Q. It supplies the field-level vocabulary that iter 5 encodes and the
+honest-current-state behavior that governs what is computed vs deferred.
+
+#### Item 0 — Core philosophy (carried forward verbatim from iter-4 Item 0)
+
+Honest partial > misleading complete. Missing by design ≠ missing by
+failure. Cross-side N/A (e.g. seller-only blocks on the buyer audit) is
+represented as explicit tri-state `null` on a uniform shape, NOT by
+omission of the key — so a reader can distinguish "not applicable on
+this side" from "should have been there but failed." The selfCheck
+array length (5) is preserved across both sides; the tri-state captures
+the honesty.
+
+#### Item 1 — `frameworkMetrics` block schema and scope
+
+Scope marker: `frameworkMetricsScope: "both"` — emitted on both audits.
+
+Shape:
+
+```json
+"frameworkMetrics": {
+  "frameworkMetricsScope": "both",
+  "cost": {
+    "totalCostUSD": <number>,
+    "currency":     "USD",
+    "byModel": {
+      "<model-name>": {
+        "calls":         <int>,
+        "inputTokens":   <int>,
+        "outputTokens":  <int>,
+        "costUSD":       <number>
+      }
+    },
+    "perCallSource": "shared/llm-client.ts estimateCostUSD (GEMINI_PRICING table dated May 2026)"
+  },
+  "outcome": {
+    "closed":               <bool>,
+    "finalPrice":           <number|null>,
+    "currency":             "INR",
+    "surplusCapturedShare": <number|null>
+  },
+  "riskAvoided": {
+    "treasuryVetoes":           <int>,
+    "maxRoundsReached":         <int>,
+    "counterpartyRejectFinal":  <int>,
+    "guardrailOverrides":       <int>,
+    "source":                   "/autonomy/commitGate/eventCounts"
+  }
+}
+```
+
+Cost source: on the SELLER audit, sum of `gemini.estimatedCostUSD`
+across every `thinkCycleTrace[].steps[stepName=geminiCall]`. On the
+BUYER audit, sum of LLM-call cost records collected by the buyer agent
+during the deal (the buyer's existing LLM telemetry, captured through
+the same `shared/llm-client.ts` instrumentation). `byModel` is the same
+sum keyed by `gen_ai.request.model`. When a side performed zero LLM
+calls, `totalCostUSD` is `0` and `byModel` is `{}` — emitted, not
+omitted (Item 0).
+
+`outcome.surplusCapturedShare` is sourced from
+`outcomeQuality.surplusSplit.buyerShare` on the buyer audit and
+`outcomeQuality.surplusSplit.sellerShare` on the seller audit. `null`
+when the deal did not close or `outcomeQuality` is absent.
+
+`riskAvoided` counts mirror `autonomy.commitGate.eventCounts` (iter-3
+addendum Item 5) into the metrics block so a regulator reading
+`frameworkMetrics` alone gets the risk-avoidance summary without
+navigating to `autonomy`. The `source` pointer makes the duplication
+explicit.
+
+**T1** ("Total cost in USD is non-zero and reasonable for round count")
+passes when `cost.totalCostUSD > 0` AND `cost.byModel` has at least one
+entry with `calls >= 1`, on any audit produced from a deal where at
+least one Gemini call succeeded. **T5** ("Cost calculation matches
+Gemini's published per-token pricing") passes when for every
+`byModel[m]`: `costUSD == round((inputTokens/1e6)*pricing[m].in +
+(outputTokens/1e6)*pricing[m].out, 8)` where `pricing` is the
+`GEMINI_PRICING` table in `shared/llm-client.ts`.
+
+#### Item 2 — `selfCheck` block schema, scope, and the 5 check names
+
+Scope marker: `selfCheckScope: "both"`. The array has length 5 on
+both sides. Cross-side N/A checks carry `passed: null` with a `note`
+explaining the scoping (Item 0).
+
+Locked check names + RFC-6901 `ref` pointers (evaluated against the
+audit JSON containing the selfCheck block):
+
+| # | check.name                  | passes when                                                                                                              | ref                       | per-side scope |
+|---|-----------------------------|--------------------------------------------------------------------------------------------------------------------------|---------------------------|----------------|
+| 1 | `identityVerified`          | `identityProof.self.lei` and `.counterparty.lei` both present; counterparty `verified === true` (plain mode)             | `/identityProof`          | both           |
+| 2 | `messageIntegrityIntact`    | every `messageLog[]` receive entry has `verification.valid === true`; `messageSigningPosture.tier` ∈ the 5-value enum    | `/messageSigningPosture`  | both           |
+| 3 | `intentDeclaredAndTracked`  | `intent.intentSource !== "NONE"` AND `intent.deviationFromIntent` present (empty `dimensions[]` is fine)                  | `/intent`                 | both           |
+| 4 | `reasoningAuditable`        | every `thinkCycleTrace[]` round has a `geminiCall` step with valid `prompt.hash` (sha256(prompt.text) == hash if text present) | `/thinkCycleTrace`    | seller-only    |
+| 5 | `delegationAttested`        | every `delegationChain[]` entry has a valid HMAC signature matching `computeDelegationSignatureValue(entry-minus-sig)`     | `/delegationChain`        | seller-only    |
+
+On the BUYER audit, checks 4 and 5 are emitted with `passed: null` and
+`note: "scope: seller-only per iter-4 addendum Item 1/4 — not
+applicable on buyer audit"`. The `ref` field on a cross-side N/A check
+is still emitted (`/thinkCycleTrace`, `/delegationChain`) so the reader
+can verify the absence with a deterministic pointer; resolving the
+pointer on the buyer audit yields "not found", which matches the honest
+tri-state.
+
+Per-check entry shape:
+
+```json
+{
+  "name":   "<one-of-five>",
+  "passed": <true|false|null>,
+  "ref":    "<RFC-6901 JSON Pointer>",
+  "note":   "<optional string>"
+}
+```
+
+#### Item 3 — `selfCheck.overallVerdict` derivation (uses Q6 enum)
+
+Q6 locks the four values: `ON_TRACK` / `ON_TRACK_BUT_FLAGGED` /
+`OFF_TRACK` / `NEEDS_REVIEW`.
+
+Derivation algorithm (locked, evaluated against the 5 checks):
+
+```
+critical       = (identityVerified === true) AND (messageIntegrityIntact === true)
+allPassedOrNA  = every check is true OR null     // null counts as passed for cross-side
+
+if (!critical)           -> "OFF_TRACK"
+else if (allPassedOrNA)  -> "ON_TRACK"
+else                     -> "ON_TRACK_BUT_FLAGGED"
+```
+
+`NEEDS_REVIEW` is reserved vocabulary for cases where the algorithm
+cannot evaluate (e.g. a referenced block is malformed, an `unknown`
+schema version is detected). It is NOT produced by a clean iter-5 audit
+on a successful deal; future iterations may emit it when explicit
+uncertainty needs to be surfaced. The enum value remains locked.
+
+#### Item 4 — `compliance` block schema, framework set, and wildcard convention
+
+Scope marker: `complianceScope: "both"`.
+
+Shape:
+
+```json
+"compliance": {
+  "complianceScope": "both",
+  "evidenceRefConvention": "RFC-6901 JSON Pointers, extended with non-standard wildcard '*' meaning 'every index in the array at the parent path'. A reader expanding a wildcard MUST emit one concrete pointer per array index found on the audit being inspected; a wildcard pointing into an absent array (e.g. /thinkCycleTrace/* on a buyer audit) resolves to zero concrete pointers, which is the honest cross-side state per Item 0.",
+  "frameworks": [
+    { "id": "NIST_AI_RMF",            "version": "1.0",                              "mappedTo": ["GOVERN-1.1", "MEASURE-2.7", "MANAGE-4.1"],                        "evidenceRefs": ["/autonomy", "/decisions", "/intent/deviationFromIntent"] },
+    { "id": "ISO_42001",              "version": "2023",                             "mappedTo": ["6.1.2", "8.2", "9.1"],                                            "evidenceRefs": ["/autonomy/capabilitiesActive", "/decisions"] },
+    { "id": "EU_AI_Act_Article_14",   "version": "Reg 2024/1689",                    "mappedTo": ["human-oversight"],                                                "evidenceRefs": ["/delegationChain/*/euAiActArticle14", "/autonomy/humanOversightPosition"] },
+    { "id": "DCC_2026",               "version": "Patil arXiv 2604.02767 (deferred)","mappedTo": ["4-of-7 properties per iter-4 Item 5"],                             "evidenceRefs": ["/delegationChain/*/dcc"] },
+    { "id": "OpenTelemetry_GenAI",    "version": "semconv v1.28",                    "mappedTo": ["gen_ai.system", "gen_ai.request.model", "gen_ai.usage.*"],        "evidenceRefs": ["/thinkCycleTrace/*/steps"] },
+    { "id": "VERIFAGENT_2025",        "version": "deferred (post-WEDGE1)",           "mappedTo": ["challenge-response (not yet wired)"],                             "evidenceRefs": [] }
+  ]
+}
+```
+
+Locked framework `id` ordering: `NIST_AI_RMF`, `ISO_42001`,
+`EU_AI_Act_Article_14`, `DCC_2026`, `OpenTelemetry_GenAI`,
+`VERIFAGENT_2025`. This is the order `frameworks[]` is emitted in.
+
+Frameworks whose `evidenceRefs[]` point into seller-only blocks (e.g.
+`EU_AI_Act_Article_14` → `/delegationChain/*/euAiActArticle14`,
+`DCC_2026` → `/delegationChain/*/dcc`, `OpenTelemetry_GenAI` →
+`/thinkCycleTrace/*/steps`) emit those wildcard pointers on BOTH audits.
+On the buyer audit those pointers resolve to zero concrete pointers,
+which is the honest cross-side N/A state per Item 0. The `complianceScope`
+remains `"both"` because the crosswalk itself applies to both audits
+uniformly; the resolved evidence count differs by side.
+
+**T4** ("compliance block has entries for NIST AI RMF, ISO 42001, EU AI
+Act Article 14, DCC") passes when those four `id` values are present in
+`frameworks[]`. `OpenTelemetry_GenAI` and `VERIFAGENT_2025` are emitted
+but not required by T4.
+
+#### Item 5 — Per-block scope markers (cross-cutting honesty, iter-4 Item 8)
+
+Iter 5 adds three scope markers, all `"both"`:
+
+| Sibling marker key      | Value    | Block              |
+|-------------------------|----------|--------------------|
+| `frameworkMetricsScope` | `"both"` | `frameworkMetrics` |
+| `selfCheckScope`        | `"both"` | `selfCheck`        |
+| `complianceScope`       | `"both"` | `compliance`       |
+
+These are append-only. If a future iteration restricts a block to one
+side, the marker flips to `"buyer-only"` or `"seller-only"` and an
+addendum entry records the change with rationale.
+
+#### Item 6 — What this addendum does NOT change
+
+- **Q6** locked value (the four `overallVerdict` enum values) — Item 3
+  implements the derivation; the enum itself is unchanged.
+- **Q8** locked value (Gemini prompt storage hash+text now, config flag
+  flips to hash-only later) — unchanged. `prompt.text` continues to be
+  the verification source for `prompt.hash`; when the flag flips, the
+  `reasoningAuditable` selfCheck still passes by verifying `prompt.hash`
+  shape alone (the verification path adapts at the iter-5 code-edit phase).
+- Buyer audit shape — unchanged from iter-3/iter-4 EXCEPT for the three
+  new top-level blocks (`frameworkMetrics`, `selfCheck`, `compliance`).
+  The seller-only blocks (`thinkCycleTrace`, `delegationChain`) remain
+  absent on the buyer.
+- The `GEMINI_PRICING` table in `shared/llm-client.ts` — used as-is for
+  iter-5 since iter-4 audits already depend on it and passed. A one-time
+  verification against Google's published per-token pricing page is
+  required before tagging iter-5; the table is updated in a follow-up
+  commit if rates have moved.
+- Existing audit-block builders (`identity-proof.ts`,
+  `message-signing-posture.ts`, `intent-block.ts`, `autonomy-block.ts`,
+  `think-cycle-trace.ts`, `delegation-chain.ts`) — none of them are
+  modified by iter-5.
+
+#### What's deferred to the iter-5 code-edit phase (not locked here)
+
+- Whether `frameworkMetrics` / `selfCheck` / `compliance` are computed
+  inline inside `saveAuditJson` (preferred default — zero agent-side
+  changes, since all three blocks are pure functions of the already-
+  assembled audit object) or assembled by the agents and passed in (the
+  iter-4 pattern). Default intent: compute inline; the audit-block
+  builders are pure functions over typed input shapes and `logger.ts`
+  orchestrates by extracting those inputs from the assembled audit just
+  before serialization. This choice can flip without changing the
+  vocabulary above.
+- The exact RFC-6901 pointer resolver used by `Test-AuditV6-Iter5.ps1`
+  to validate selfCheck `ref` fields against the audit JSON. PowerShell-
+  side detail; the JSON Pointers themselves are locked above.
+
 ---
 
 **End of decisions reference.**

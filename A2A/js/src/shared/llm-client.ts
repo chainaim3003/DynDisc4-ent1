@@ -11,6 +11,7 @@
 //   PER_NEGOTIATION_TOKEN_CEILING  default 20000
 //   GEMINI_MAX_RETRIES          default 3 (for 429 backoff)
 //
+import crypto from "node:crypto";
 import { GoogleGenAI, GenerateContentConfig } from "@google/genai";
 import { LLMResponse, AgentRole } from "./negotiation-types.js";
 
@@ -68,6 +69,19 @@ export interface LLMResponseWithAudit extends LLMResponse {
                          | "GEMINI_ERROR_RULES_FALLBACK"
                          | "GEMINI_TOKEN_CEILING_REACHED";
         retries:           number;
+        // Audit Framework v6 — Iter 4: prompt capture for thinkCycleTrace[]
+        // step 4 (DECISIONS addendum 2026-05-25, Items 2 + 3).
+        //   - `hash` is always present when the prompt was built (i.e. any
+        //     decisionPath EXCEPT GEMINI_TOKEN_CEILING_REACHED, where the
+        //     prompt was never built per Item 0 / Item 2).
+        //   - `text` is always populated by llm-client; the audit-block
+        //     builder gates inclusion via env var AUDIT_INCLUDE_PROMPT_TEXT
+        //     (DECISIONS Q-iter4-B = Option 1) and drops `text` while keeping
+        //     `hash` when the flag is "false".
+        prompt?: {
+            text: string;
+            hash: string;
+        };
     };
 }
 
@@ -187,10 +201,19 @@ export class LLMNegotiationClient {
                 `⚠ Token ceiling reached (${this.budget.used()}/${this.budget.cap()}). ` +
                 `Skipping LLM call, using rules fallback.`
             );
+            // Iter 4: token-ceiling fallback — no prompt was built or sent, so
+            // the audit's `prompt` field is omitted entirely (DECISIONS Item 0
+            // / Item 2: omit, do not null).
             return this.fallbackResponse(context, model, t0, 0, "GEMINI_TOKEN_CEILING_REACHED");
         }
 
         const prompt       = this.buildPrompt(context);
+        // Audit Framework v6 — Iter 4: hash the prompt at build time for the
+        // thinkCycleTrace[] step-4 audit entry (DECISIONS Item 2). Hash is
+        // always emitted in the audit when the prompt was built; text is
+        // passed through and the builder gates its inclusion via the
+        // AUDIT_INCLUDE_PROMPT_TEXT env flag (Item 3).
+        const promptHash   = crypto.createHash("sha256").update(prompt).digest("hex");
         const systemPrompt =
             `You are an expert negotiation AI ${context.role === "BUYER" ? "buyer" : "seller"} agent. ` +
             `You must make strategic decisions to maximize your goals while being realistic about deal closure. ` +
@@ -249,6 +272,9 @@ export class LLMNegotiationClient {
                         latencyMs:        Date.now() - t0,
                         decisionPath:     "GEMINI_OK",
                         retries:          attempt,
+                        // Iter 4: prompt capture for audit. Builder strips
+                        // .text when AUDIT_INCLUDE_PROMPT_TEXT=false.
+                        prompt:           { text: prompt, hash: promptHash },
                     },
                 };
 
@@ -275,8 +301,11 @@ export class LLMNegotiationClient {
                 // JSON parse error → log and fall through to fallback
                 if (err instanceof SyntaxError) {
                     console.error(`❌ Gemini returned invalid JSON: ${err.message}`);
+                    // Iter 4: prompt WAS built + sent on this path, so pass it
+                    // through to the audit (we just didn't get usable JSON back).
                     return this.fallbackResponse(
-                        context, model, t0, attempt, "GEMINI_INVALID_JSON_RULES_FALLBACK"
+                        context, model, t0, attempt, "GEMINI_INVALID_JSON_RULES_FALLBACK",
+                        prompt, promptHash,
                     );
                 }
 
@@ -297,8 +326,11 @@ export class LLMNegotiationClient {
             model,
             t0,
             this.maxRetries,
-            rateLimited ? "GEMINI_RATE_LIMITED_RULES_FALLBACK"
-                        : "GEMINI_ERROR_RULES_FALLBACK"
+            (rateLimited ? "GEMINI_RATE_LIMITED_RULES_FALLBACK"
+                         : "GEMINI_ERROR_RULES_FALLBACK"),
+            // Iter 4: prompt WAS built + sent on rate-limit / error paths.
+            prompt,
+            promptHash,
         );
     }
 
@@ -313,6 +345,12 @@ export class LLMNegotiationClient {
         t0:           number,
         retries:      number,
         decisionPath: NonNullable<LLMResponseWithAudit["audit"]>["decisionPath"],
+        // Iter 4: prompt + hash optional. Omitted when the prompt was never
+        // built (GEMINI_TOKEN_CEILING_REACHED) per DECISIONS Item 0 / Item 2.
+        // Present for INVALID_JSON / RATE_LIMITED / ERROR paths because the
+        // prompt WAS built and sent — we just didn't get a usable response.
+        prompt?:      string,
+        promptHash?:  string,
     ): LLMResponseWithAudit {
         return {
             action:     "COUNTER",
@@ -329,6 +367,10 @@ export class LLMNegotiationClient {
                 latencyMs:        Date.now() - t0,
                 decisionPath,
                 retries,
+                // Iter 4: include prompt when it was actually built/sent.
+                ...(prompt !== undefined && promptHash !== undefined
+                    ? { prompt: { text: prompt, hash: promptHash } }
+                    : {}),
             },
         };
     }
