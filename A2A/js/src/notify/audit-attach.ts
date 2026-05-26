@@ -20,6 +20,7 @@
 import fs from "fs";
 import { getNotifier } from "./router.js";
 import type { DeliveryReceipt } from "./types.js";
+import { redactNotifications } from "../shared/notification-redactor.js";
 
 export interface AttachOptions {
   /** Set to false to keep receipts in the router after attach (default: drain). */
@@ -74,7 +75,7 @@ export function attachNotificationsToAudit(
     if (r.providerMessageId) seen.add(r.providerMessageId);
   }
 
-  audit.notifications = merged;
+  audit.notifications = redactNotifications(merged);
   // Add a small summary for easy PDF/UI consumption
   audit.notificationsSummary = summarize(merged);
 
