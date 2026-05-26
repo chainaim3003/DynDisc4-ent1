@@ -1185,3 +1185,139 @@ are recorded in this addendum as the audit trail for "Step F closed."
 ---
 
 **End of decisions reference.**
+
+---
+
+## Addendum 2026-05-26 — Iteration 7 code-edit phase
+
+During implementation of Iter-7 (AuditReportingAgent on :7074, daily/weekly
+cron + on-demand UI/A2A triggers, forensic PDF), the following items were
+locked at code-edit time. They sit ALONGSIDE the Q-decisions, not in conflict
+with them.
+
+### Item 11 — Templates location: co-located, not under `packages/`
+
+The iter-7 plan referenced `packages/audit-framework-procurement/templates/`
+as the home for the Handlebars templates. That folder does not exist in this
+repo — `package.json` declares a `workspaces: ["packages/*"]` entry but no
+workspace packages have been created yet. Rather than introduce an unused
+workspace member, the three templates ship inside the agent itself:
+
+```
+A2A/js/src/agents/audit-reporting-agent/
+├── index.ts
+└── templates/
+    ├── daily.md.hbs
+    ├── weekly.md.hbs
+    └── forensic.md.hbs
+```
+
+Resolved via `path.join(__dirname, "templates")` so the agent is portable
+regardless of where the process is launched from. If a workspace package
+later materializes, the templates can be lifted out unchanged.
+
+### Item 12 — Cache implementation
+
+In-process `Map<string, { payload, expiresAt }>`. Key shape
+`${reportType}:${windowKey}` (e.g. `daily:2026-05-26`, `weekly:2026-05-25`).
+TTL = 5 minutes (Q26). On-demand UI triggers DO NOT use the cache — only
+the `/a2a/reports/trigger` endpoint reads/writes it. UI triggers
+always generate fresh because a UI user clicking "Generate now" expects
+freshness.
+
+The cache is process-local; restarting the agent clears it. Acceptable
+because the underlying report files persist on disk, and Q26 framed the
+cache as a freshness/cost optimization for high-frequency A2A polling, not
+a correctness requirement.
+
+### Item 13 — Self-audit shape
+
+The AuditReportingAgent writes one `report-generation.audit.json` per
+report invocation under `audits/<today-utc>/NEG-RG-<epochms>/`. The shape
+is a strict subset of the negotiation audit, retaining only the fields
+that make sense for a non-negotiation actor:
+
+```ts
+interface ReportGenerationSelfAudit {
+    schemaVersion:        1;
+    auditKind:            "report-generation";
+    actorId:              string;
+    actorRole:            string;
+    reportType:           "daily" | "weekly" | "forensic";
+    reportKey:            string;
+    outputPath:           string;
+    triggerSource:        "cron" | "http-ui" | "http-a2a";
+    durationMs:           number;
+    inputLineCount?:      number;       // daily/weekly: index.jsonl lines scanned
+    targetNegotiationId?: string;       // forensic only
+    pdfBytes?:            number;       // forensic only
+    authority:            AuthorityEnvelope;
+    startedAt:            string;       // ISO 8601
+    completedAt:          string;       // ISO 8601
+}
+```
+
+Fields explicitly OMITTED vs `NegotiationAudit`: `decisions[]`,
+`outcomeQuality`, `intent`, `autonomy`, `thinkCycleTrace[]`,
+`delegationChain[]`, `messageLog[]`. None of those apply to a
+report-generation event. `frameworkMetrics` is also omitted today
+(the agent does no LLM work in iter-7); if it grows LLM-backed
+summarization in a later iter, that block lights up then.
+
+The `NEG-RG-<epochms>` ID prefix deliberately does NOT match the
+`/^NEG-(\d+)$/` regex in `audit-paths.ts → deriveUtcDateFromNegotiationId()`,
+so the date partition falls back to today's UTC date — exactly what we
+want for an actor-scoped (not deal-scoped) audit.
+
+### Item 14 — Cron timezone
+
+Every `cron.schedule()` call passes `{ timezone: "UTC" }`. node-cron's
+default is process-local time, which would silently drift IST → UTC by
+5.5 hours and corrupt the daily/weekly window boundaries. Pinned package:
+`node-cron@^3.0.3` (v4 type support is incomplete as of iter-7 lock).
+
+### Item 15 — Authority envelope JSON shape
+
+Per Q27 the agent runs as Chief Audit Officer on a plain (non-vLEI) JSON
+envelope. The shape, built once at process start and embedded into every
+self-audit + report header:
+
+```ts
+interface AuthorityEnvelope {
+    actorId:        string;            // "AGT-RG-<epochms>"
+    actorType:      "AuditReportingAgent";
+    role:           "Chief Audit Officer";
+    credentialMode: "plain";
+    vLeiDeferred:   true;
+    authorityScope: string[];          // enumerated below
+    issuedAt:       string;            // ISO 8601
+    lei:            null;              // explicit null until vLEI lands
+}
+```
+
+Locked `authorityScope`:
+- `generate-daily-report`
+- `generate-weekly-report`
+- `generate-forensic-report`
+- `read-audit-corpus`
+- `write-self-audit`
+
+When vLEI lights up in a later iteration, `credentialMode` flips to
+`"vlei"`, `vLeiDeferred` flips to `false`, `lei` populates with the
+actual identifier, and a vLEI signature block joins the envelope. The
+field names above are stable across that change.
+
+### What this addendum does NOT change
+
+- Any prior Q-decision (Q1-Q27) — unchanged.
+- The per-deal audit JSON shape — unchanged. Report-generation self-audits
+  use a different schema (`auditKind: "report-generation"`), so the
+  AuditIndexLine writer is not invoked for them. (They live alongside
+  negotiation audits under the same date partitions but are not indexed
+  in `index.jsonl`.)
+- The shared PDF rendering in `shared/audit-pdf.ts` — the agent imports
+  `generateAuditPdf()` and never duplicates rendering.
+- The reports root layout (`daily/`, `weekly/`, `on-demand/`) — Iter-1
+  Phase-1 already created these.
+
+---

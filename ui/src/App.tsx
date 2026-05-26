@@ -11,6 +11,7 @@ import { AgentCenter } from "@/pages/AgentCenter";
 import { ContractManagement } from "@/pages/ContractManagement";
 import { RiskAnalytics } from "@/pages/RiskAnalytics";
 import { DealQuality } from "@/pages/DealQuality";
+import { AuditReports } from "@/pages/AuditReports";
 import { Settings } from "@/pages/Settings";
 import NotFound from "./pages/NotFound";
 
@@ -33,6 +34,7 @@ const App = () => {
                 <Route path="/contracts" element={<ContractManagement simulation={simulation} />} />
                 <Route path="/risk" element={<RiskAnalytics simulation={simulation} />} />
                 <Route path="/deal-quality" element={<DealQuality />} />
+                <Route path="/audit-reports" element={<AuditReports />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="*" element={<NotFound />} />
               </Routes>

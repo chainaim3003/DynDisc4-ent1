@@ -6,16 +6,26 @@
 // the seller-side audit for richer treasury detail). Streams to any
 // `NodeJS.WritableStream` (Express `res`, file write stream, etc.).
 //
-// Sections (in order):
-//   1. Cover                — counterparties, LEIs, deal terms, timestamp
+// Sections (in order) — iter-7 extension renders all 14 v6 audit blocks:
+//   1. Deal Summary         — counterparties (agentSelf, agentCounterparty),
+//                             LEIs, deal terms, timestamp
 //   2. Outcome Quality      — IR, ZOPA, NBS, surplus split (iter 3 metrics)
-//   3. Decision Trail       — per-round LLM proposal + constraint adjust +
-//                             treasury override + final decision (iter 4)
+//   3. Decision Trail       — decisions[] — per-round LLM proposal +
+//                             constraint adjust + treasury override (iter 4)
 //   4. Market Context       — SOFR per round, effective borrowing rate
-//   5. GLEIF / vLEI Chain   — identity provenance for both parties
-//   6. Envelope Hashes      — signing-mode disclosure, monotonic counters
-//   7. Document Provenance  — generation timestamp + audit source
-//   8. External Notifications — WhatsApp / email / SMS delivery receipts (iter 15)
+//   5. Identity Provenance  — identityProof — GLEIF/vLEI mode + chain (iter 2)
+//   6. Wire Signing         — messageSigningPosture — signing tier + counters
+//   7. Stated Intent        — intent — declared mandate +
+//                             deviationFromIntent (iter 3)
+//   8. Self-Check Verdict   — selfCheck — 5 checks + overallVerdict (iter 5)
+//   9. Reasoning Trace      — thinkCycleTrace — per-round think cycles (iter 4)
+//  10. Delegation Chain     — delegationChain — sub-agent calls + DCC (iter 4)
+//  11. Autonomy Posture     — autonomy — six pillars + HITC/HITL/HOTL/HOOTL (iter 3)
+//  12. LLM Economics       — frameworkMetrics — cost, tokens by model (iter 5)
+//  13. Wire Message Log     — messageLog — every seal()/verify() event (iter 2)
+//  14. Compliance Mapping   — compliance — 6 framework references (iter 5)
+//  15. External Notifications — WhatsApp / email / SMS delivery receipts
+//  16. Document Provenance  — generation timestamp + audit source
 //
 // Library: pdfkit (mature, zero-config, sync stream API).
 //
@@ -268,7 +278,7 @@ function drawMarketContext(doc: PDFKit.PDFDocument, audit: AnyRecord) {
   }
 }
 
-// 5. GLEIF / vLEI Chain ---------------------------------------------------
+// 5. Identity Provenance (identityProof block — iter 2) -------------------
 function drawIdentity(doc: PDFKit.PDFDocument, audit: AnyRecord) {
   drawSectionTitle(doc, "5. Identity Provenance");
 
@@ -308,26 +318,26 @@ function drawEnvelopes(doc: PDFKit.PDFDocument, audit: AnyRecord) {
   doc.moveDown(0.3);
 }
 
-// 7. Footer ---------------------------------------------------------------
+// 16. Footer ---------------------------------------------------------------
 function drawFooter(doc: PDFKit.PDFDocument, audit: AnyRecord) {
-  drawSectionTitle(doc, "7. Document Provenance");
+  drawSectionTitle(doc, "16. Document Provenance");
   drawKV(doc, "Source audit file", `${safe(audit.negotiationId)}_${audit.outcome === "success" ? "success" : "escalation"}_BUYER.audit.json`);
   drawKV(doc, "PDF generated at",  fmtDate(new Date().toISOString()));
-  drawKV(doc, "Generator",         "LegentPro audit-pdf.ts (iteration 7)");
+  drawKV(doc, "Generator",         "LegentPro audit-pdf.ts (iteration 7 — renders all 14 v6 blocks)");
   doc.moveDown(0.3);
   doc.fillColor(C.muted).fontSize(8).font("Helvetica-Oblique")
      .text("This PDF is a faithful rendering of the audit JSON written by the buyer agent at deal close. It is summary-of-record, not a cryptographically counter-signed document. Hash counters, GLEIF identities, and decision logs reproduce values stored in the source audit JSON; any tampering must be verified against that source.",
        { width: 500 });
 }
 
-// 8. External Notifications (iter 15) -------------------------------------
+// 15. External Notifications (iter 15) -------------------------------------
 //
 // Lists every WhatsApp / SMS / email / dashboard notification the router
 // shipped during this negotiation, with provider-assigned message IDs.
 // Each row is the auditable proof that party X was notified of event Y
 // at time Z via channel C in mode M (test-number vs production vs BSP).
 function drawExternalNotifications(doc: PDFKit.PDFDocument, audit: AnyRecord) {
-  drawSectionTitle(doc, "8. External Notifications");
+  drawSectionTitle(doc, "15. External Notifications");
 
   const receipts: any[] = Array.isArray(audit.notifications) ? audit.notifications : [];
   const summary = audit.notificationsSummary;
@@ -441,6 +451,367 @@ function redactPhone(s: string): string {
   return `${cc}…${tail}`;
 }
 
+// ── Iter-7 extension: v6-block section drawers ─────────────────────────────
+//
+// Every drawer below probes the audit JSON with optional chaining and falls
+// back to a muted "block not present" line when the corresponding v6 block
+// is missing (pre-iter-N deal). No throws on partial JSON — the PDF is meant
+// to be readable for any deal in the archive, including pre-v6 ones.
+//
+// Layout choice: each drawer is locally self-contained (no shared mutable
+// state across drawers); doc.y is advanced naturally by pdfkit’s text API.
+//
+// Honest gap: rich nested arrays (e.g. delegationChain[].thinkCycleTrace[])
+// are summarized, not exhaustively dumped — the audit JSON remains the
+// canonical record. The PDF is a regulator-grade *index* into the JSON.
+// ───────────────────────────────────────────────────────────────────────────
+
+// 7. Stated Intent (intent block — iter 3) --------------------------------
+function drawIntent(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "7. Stated Intent");
+
+  const intent = audit.intent;
+  if (!intent) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("Intent block not present in this audit (pre-iteration-3 deal).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  drawKV(doc, "Intent source",   safe(intent.intentSource));
+  if (intent.scenarioId)    drawKV(doc, "Scenario ID",    safe(intent.scenarioId));
+  if (intent.scenarioTitle) drawKV(doc, "Scenario title", safe(intent.scenarioTitle));
+
+  const eo = intent.expectedOutcome ?? {};
+  drawKV(doc, "Expected shape", safe(eo.shape));
+  if (eo.likely) {
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica").text("Likely outcome:");
+    doc.fillColor(C.ink).fontSize(9).font("Helvetica-Oblique")
+       .text(safe(eo.likely), { width: 480, indent: 10 });
+    doc.moveDown(0.2);
+  }
+  if (eo.priceRange) {
+    drawKV(doc, "Expected price range",
+      `${eo.priceRange.minPerUnit}–${eo.priceRange.maxPerUnit} ${safe(eo.priceRange.currency)}`);
+  }
+  if (eo.roundRange) {
+    drawKV(doc, "Expected rounds", `${eo.roundRange.minRounds}–${eo.roundRange.maxRounds}`);
+  }
+
+  const dev = intent.deviationFromIntent ?? {};
+  const sev = String(dev.overallSeverity ?? "none");
+  const sevColor = sev === "high" ? C.bad : sev === "medium" ? C.warn : sev === "low" ? C.warn : C.good;
+  drawKV(doc, "Deviation severity", sev, sevColor);
+
+  const dims: any[] = Array.isArray(dev.dimensions) ? dev.dimensions : [];
+  if (dims.length) {
+    doc.moveDown(0.2);
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica-Oblique")
+       .text(`Deviation dimensions (${dims.length}):`);
+    doc.moveDown(0.1);
+    for (const d of dims) {
+      drawKV(doc, `  ${safe(d.dimension)} [${safe(d.severity)}]`,
+        `expected: ${safe(d.expected)} → actual: ${safe(d.actual)}`);
+      if (d.note) {
+        doc.fillColor(C.ink).fontSize(8).font("Helvetica-Oblique")
+           .text(safe(d.note), { width: 460, indent: 30 });
+        doc.moveDown(0.15);
+      }
+    }
+  }
+}
+
+// 8. Self-Check Verdict (selfCheck block — iter 5) ------------------------
+function drawSelfCheck(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "8. Self-Check Verdict");
+
+  const sc = audit.selfCheck;
+  if (!sc) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("Self-check block not present in this audit (pre-iteration-5 deal).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  const verdict = String(sc.overallVerdict ?? "NEEDS_REVIEW");
+  const vColor =
+    verdict === "ON_TRACK"             ? C.good :
+    verdict === "ON_TRACK_BUT_FLAGGED" ? C.warn :
+    verdict === "OFF_TRACK"            ? C.bad  :
+    C.muted;
+  drawKV(doc, "Overall verdict", verdict, vColor);
+
+  const checks: any[] = Array.isArray(sc.checks) ? sc.checks : [];
+  if (!checks.length) {
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica-Oblique")
+       .text("No checks recorded.", { indent: 10 });
+    doc.moveDown(0.3);
+    return;
+  }
+
+  doc.moveDown(0.2);
+  for (const c of checks) {
+    const passed = c.passed;
+    const status =
+      passed === true  ? "PASS" :
+      passed === false ? "FAIL" :
+      passed === null  ? "N/A"  :
+      String(passed);
+    const sColor =
+      passed === true  ? C.good :
+      passed === false ? C.bad  :
+      C.muted;
+    drawKV(doc, `  ${safe(c.name)}`, status, sColor);
+    if (c.ref) {
+      doc.fillColor(C.muted).fontSize(8).font("Helvetica")
+         .text(`ref: ${safe(c.ref)}`, { indent: 20 });
+      doc.moveDown(0.1);
+    }
+    if (c.note) {
+      doc.fillColor(C.ink).fontSize(8).font("Helvetica-Oblique")
+         .text(safe(c.note), { width: 460, indent: 20 });
+      doc.moveDown(0.15);
+    }
+  }
+}
+
+// 9. Reasoning Trace (thinkCycleTrace block — iter 4) ---------------------
+function drawThinkCycleTrace(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "9. Reasoning Trace");
+
+  const trace: any[] = Array.isArray(audit.thinkCycleTrace) ? audit.thinkCycleTrace : [];
+  if (!trace.length) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("No think-cycle trace recorded (pre-iteration-4 deal or no LLM cycles ran).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  drawKV(doc, "Think cycles", String(trace.length));
+  doc.moveDown(0.2);
+
+  for (const t of trace) {
+    if (doc.y > doc.page.height - 140) doc.addPage();
+    const round = t.round ?? t.cycleIndex ?? "—";
+    doc.fillColor(C.band)
+       .rect(doc.page.margins.left, doc.y, doc.page.width - doc.page.margins.left - doc.page.margins.right, 14)
+       .fill();
+    doc.fillColor(C.ink).fontSize(9).font("Helvetica-Bold")
+       .text(`Cycle ${round} — ${safe(t.phase ?? t.stage ?? "think")}`,
+             doc.page.margins.left + 6, doc.y - 11);
+    doc.moveDown(0.35);
+
+    if (t.promptHash) drawKV(doc, "  Prompt hash", String(t.promptHash));
+    if (t.modelName)  drawKV(doc, "  Model",       String(t.modelName));
+    if (typeof t.durationMs === "number") drawKV(doc, "  Duration", `${t.durationMs} ms`);
+    if (t.summary || t.reasoning) {
+      doc.fillColor(C.muted).fontSize(9).font("Helvetica").text("Summary:", { indent: 10 });
+      doc.fillColor(C.ink).fontSize(9).font("Helvetica-Oblique")
+         .text(safe(t.summary ?? t.reasoning), { width: 460, indent: 20 });
+      doc.moveDown(0.2);
+    }
+  }
+}
+
+// 10. Delegation Chain (delegationChain block — iter 4) ------------------
+function drawDelegationChain(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "10. Delegation Chain");
+
+  const chain: any[] = Array.isArray(audit.delegationChain) ? audit.delegationChain : [];
+  if (!chain.length) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("No delegation chain recorded (pre-iteration-4 deal or no sub-agent calls).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  drawKV(doc, "Delegation entries", String(chain.length));
+  doc.moveDown(0.2);
+
+  for (const e of chain) {
+    if (doc.y > doc.page.height - 160) doc.addPage();
+    doc.fillColor(C.band)
+       .rect(doc.page.margins.left, doc.y, doc.page.width - doc.page.margins.left - doc.page.margins.right, 14)
+       .fill();
+    const header =
+      `${safe(e.from ?? e.delegator)} → ${safe(e.to ?? e.delegatee)}` +
+      (e.role ? ` [${e.role}]` : "");
+    doc.fillColor(C.ink).fontSize(9).font("Helvetica-Bold")
+       .text(header, doc.page.margins.left + 6, doc.y - 11);
+    doc.moveDown(0.35);
+
+    if (e.purpose)       drawKV(doc, "  Purpose",      String(e.purpose));
+    if (e.invokedAt)     drawKV(doc, "  Invoked at",   fmtDate(e.invokedAt));
+    if (e.completedAt)   drawKV(doc, "  Completed at", fmtDate(e.completedAt));
+    if (e.outcome)       drawKV(doc, "  Outcome",      String(e.outcome));
+    if (e.dcc) {
+      doc.fillColor(C.muted).fontSize(8).font("Helvetica-Oblique")
+         .text("DCC (delegated-control-context):", { indent: 10 });
+      doc.moveDown(0.1);
+      for (const [k, v] of Object.entries(e.dcc)) {
+        if (v === null || v === undefined) continue;
+        const vs = typeof v === "object" ? JSON.stringify(v) : String(v);
+        doc.fillColor(C.ink).fontSize(8).font("Helvetica")
+           .text(`${k} = ${vs}`, { width: 460, indent: 20 });
+      }
+      doc.moveDown(0.15);
+    }
+  }
+}
+
+// 11. Autonomy Posture (autonomy block — iter 3) -------------------------
+function drawAutonomy(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "11. Autonomy Posture");
+
+  const a = audit.autonomy;
+  if (!a) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("Autonomy block not present in this audit (pre-iteration-3 deal).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  if (a.posture)          drawKV(doc, "Posture (HITC/L/OTL)", String(a.posture));
+  if (a.overallTier)      drawKV(doc, "Overall tier",         String(a.overallTier));
+  if (a.humanInLoop !== undefined) drawKV(doc, "Human-in-loop", a.humanInLoop ? "Yes" : "No");
+
+  const pillars = a.sixPillars ?? a.pillars;
+  if (pillars && typeof pillars === "object") {
+    doc.moveDown(0.2);
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica-Oblique").text("Six pillars:");
+    doc.moveDown(0.1);
+    for (const [k, v] of Object.entries(pillars)) {
+      if (v === null || v === undefined) continue;
+      const vs = typeof v === "object" ? JSON.stringify(v) : String(v);
+      drawKV(doc, `  ${k}`, vs);
+    }
+  }
+}
+
+// 12. LLM Economics (frameworkMetrics block — iter 5) -------------------
+function drawFrameworkMetrics(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "12. LLM Economics");
+
+  const fm = audit.frameworkMetrics;
+  if (!fm) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("Framework-metrics block not present in this audit (pre-iteration-5 deal).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  const cost = fm.cost ?? {};
+  drawKV(doc, "Total cost (USD)", typeof cost.totalCostUSD === "number" ? "$" + cost.totalCostUSD.toFixed(6) : "—");
+  if (typeof cost.totalInputTokens  === "number") drawKV(doc, "Input tokens (total)",  String(cost.totalInputTokens));
+  if (typeof cost.totalOutputTokens === "number") drawKV(doc, "Output tokens (total)", String(cost.totalOutputTokens));
+
+  const byModel = cost.byModel;
+  if (byModel && typeof byModel === "object") {
+    doc.moveDown(0.2);
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica-Oblique").text("By model:");
+    doc.moveDown(0.1);
+    for (const [model, m] of Object.entries<any>(byModel)) {
+      if (!m || typeof m !== "object") continue;
+      const line =
+        `in=${m.inputTokens ?? "—"} out=${m.outputTokens ?? "—"} ` +
+        `cost=` + (typeof m.costUSD === "number" ? "$" + m.costUSD.toFixed(6) : "—");
+      drawKV(doc, `  ${model}`, line);
+    }
+  }
+
+  if (fm.outcome) {
+    doc.moveDown(0.2);
+    drawKV(doc, "Negotiation outcome", String(fm.outcome));
+  }
+  if (typeof fm.riskAvoided === "number") {
+    drawKV(doc, "Risk avoided", fmtCurrency(fm.riskAvoided, audit.outcomeQuality?.currency));
+  }
+}
+
+// 13. Wire Message Log (messageLog block — iter 2) ----------------------
+function drawMessageLog(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "13. Wire Message Log");
+
+  const log: any[] = Array.isArray(audit.messageLog) ? audit.messageLog : [];
+  if (!log.length) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("No wire message log recorded (pre-iteration-2 deal or no signed messages).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  drawKV(doc, "Message events", String(log.length));
+  doc.moveDown(0.2);
+
+  // Render at most the first 40 events to keep the PDF bounded; reference
+  // the JSON for the full log. This is an explicit honest-summary choice.
+  const MAX = 40;
+  const shown = log.slice(0, MAX);
+  for (const m of shown) {
+    if (doc.y > doc.page.height - 100) doc.addPage();
+    const ts = fmtDate(m.timestamp ?? m.at);
+    const dir = m.direction ?? m.event ?? "event";
+    const tier = m.tier ?? m.signingMode ?? "—";
+    const counter = m.counter !== undefined ? `#${m.counter}` : "";
+    drawKV(doc, `  ${ts}`, `${dir} [tier=${tier}] ${counter} ${safe(m.peer ?? m.role ?? "")}`);
+  }
+  if (log.length > MAX) {
+    doc.moveDown(0.2);
+    doc.fillColor(C.muted).fontSize(8).font("Helvetica-Oblique")
+       .text(`… ${log.length - MAX} more events truncated. See audit JSON for the full log.`, { width: 480 });
+    doc.moveDown(0.2);
+  }
+}
+
+// 14. Compliance Framework Mapping (compliance block — iter 5) ---------
+function drawCompliance(doc: PDFKit.PDFDocument, audit: AnyRecord) {
+  drawSectionTitle(doc, "14. Compliance Mapping");
+
+  const c = audit.compliance;
+  if (!c) {
+    doc.fillColor(C.muted).fontSize(10).font("Helvetica-Oblique")
+       .text("Compliance block not present in this audit (pre-iteration-5 deal).");
+    doc.moveDown(0.4);
+    return;
+  }
+
+  if (c.evidenceRefConvention) {
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica").text("Evidence-ref convention:");
+    doc.fillColor(C.ink).fontSize(9).font("Helvetica-Oblique")
+       .text(String(c.evidenceRefConvention), { width: 480, indent: 10 });
+    doc.moveDown(0.2);
+  }
+
+  const frameworks: any[] = Array.isArray(c.frameworks) ? c.frameworks : [];
+  if (!frameworks.length) {
+    doc.fillColor(C.muted).fontSize(9).font("Helvetica-Oblique")
+       .text("No frameworks recorded.", { indent: 10 });
+    doc.moveDown(0.3);
+    return;
+  }
+
+  drawKV(doc, "Frameworks mapped", String(frameworks.length));
+  doc.moveDown(0.15);
+
+  for (const f of frameworks) {
+    if (doc.y > doc.page.height - 120) doc.addPage();
+    drawKV(doc, `  ${safe(f.id)}`, `v${safe(f.version)}`);
+    const mappedTo: any[] = Array.isArray(f.mappedTo) ? f.mappedTo : [];
+    if (mappedTo.length) {
+      doc.fillColor(C.muted).fontSize(8).font("Helvetica")
+         .text(`mapped: ${mappedTo.join(", ")}`, { width: 460, indent: 20 });
+      doc.moveDown(0.1);
+    }
+    const refs: any[] = Array.isArray(f.evidenceRefs) ? f.evidenceRefs : [];
+    if (refs.length) {
+      doc.fillColor(C.muted).fontSize(8).font("Helvetica")
+         .text(`evidence: ${refs.slice(0, 4).join(", ")}${refs.length > 4 ? ` (+${refs.length - 4} more)` : ""}`,
+               { width: 460, indent: 20 });
+      doc.moveDown(0.15);
+    }
+  }
+}
+
 // ── Public entry point ─────────────────────────────────────────────────────
 
 /**
@@ -476,14 +847,22 @@ export async function generateAuditPdf(
   }
 
   drawHeader(doc, audit);
-  drawCover(doc, audit);
-  drawOutcomeQuality(doc, audit);
-  drawDecisionTrail(doc, audit);
-  drawMarketContext(doc, audit);
-  drawIdentity(doc, audit);
-  drawEnvelopes(doc, audit);
-  drawFooter(doc, audit);
-  drawExternalNotifications(doc, audit);
+  drawCover(doc, audit);                  //  1. Deal Summary (agentSelf + agentCounterparty)
+  drawOutcomeQuality(doc, audit);         //  2. Outcome Quality
+  drawDecisionTrail(doc, audit);          //  3. Decision Trail (decisions)
+  drawMarketContext(doc, audit);          //  4. Market Context
+  drawIdentity(doc, audit);               //  5. Identity Provenance (identityProof)
+  drawEnvelopes(doc, audit);              //  6. Wire Signing (messageSigningPosture)
+  drawIntent(doc, audit);                 //  7. Stated Intent (intent)            — iter-7
+  drawSelfCheck(doc, audit);              //  8. Self-Check Verdict (selfCheck)    — iter-7
+  drawThinkCycleTrace(doc, audit);        //  9. Reasoning Trace (thinkCycleTrace) — iter-7
+  drawDelegationChain(doc, audit);        // 10. Delegation Chain (delegationChain)— iter-7
+  drawAutonomy(doc, audit);               // 11. Autonomy Posture (autonomy)       — iter-7
+  drawFrameworkMetrics(doc, audit);       // 12. LLM Economics (frameworkMetrics)  — iter-7
+  drawMessageLog(doc, audit);             // 13. Wire Message Log (messageLog)     — iter-7
+  drawCompliance(doc, audit);             // 14. Compliance Mapping (compliance)   — iter-7
+  drawExternalNotifications(doc, audit);  // 15. External Notifications
+  drawFooter(doc, audit);                 // 16. Document Provenance (always last)
 
   doc.end();
 

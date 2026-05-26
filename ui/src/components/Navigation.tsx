@@ -7,6 +7,7 @@ import {
   BarChart3, 
   Cpu,
   Scale,
+  FileBarChart,
   Settings as SettingsIcon,
 } from 'lucide-react';
 import { ThemeToggle } from './ThemeToggle';
@@ -17,6 +18,7 @@ const navItems = [
   { to: '/contracts', icon: FileText, label: 'Treasury Management' },
   { to: '/risk', icon: BarChart3, label: 'Risk & Analytics' },
   { to: '/deal-quality', icon: Scale, label: 'Deal Quality' },
+  { to: '/audit-reports', icon: FileBarChart, label: 'Audit Reports' },
   { to: '/settings', icon: SettingsIcon, label: 'Settings' },
 ];
 

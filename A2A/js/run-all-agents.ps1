@@ -1,5 +1,5 @@
 # ============================================================================
-# run-all-agents.ps1 — Launch all 7 agents in separate PowerShell windows
+# run-all-agents.ps1 — Launch all 8 agents in separate PowerShell windows
 # ============================================================================
 #
 # Each agent runs in its own PowerShell window so you can see live console
@@ -12,12 +12,14 @@
 #   3. Seller, then buyer (which fetches seller's agent card on startup)
 #
 # Ports (all on localhost):
-#   buyer       9090
-#   seller      8080
-#   treasury    7070
-#   credit      7071
-#   inventory   7072
-#   logistics   7073
+#   buyer            9090
+#   seller           8080
+#   treasury         7070
+#   credit           7071
+#   inventory        7072
+#   logistics        7073
+#   audit-reporting  7074
+#   audit-query      5000  (GraphQL)
 #
 # To stop everything: run stop-all-agents.ps1, or close each window.
 #
@@ -39,7 +41,7 @@ if (-not (Test-Path (Join-Path $JsRoot "package.json"))) {
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Launching all 7 agents (each in its own PowerShell window)"  -ForegroundColor Cyan
+Write-Host "  Launching all 8 agents (each in its own PowerShell window)"  -ForegroundColor Cyan
 Write-Host "  Working directory: $JsRoot"                                   -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -113,23 +115,25 @@ Start-AgentWindow -Name "Tommy Buyer Agent"    -NpmScript "agents:buyer"  -Port 
 Write-Host ""
 
 # ----------------------------------------------------------------------------
-# Phase 3: audit query service (Iter 6 — standalone GraphQL + SQLite sidecar)
+# Phase 3: audit services (Iter 6 query GraphQL + Iter 7 reporting agent)
 # ----------------------------------------------------------------------------
-Write-Host "Phase 3: Launching audit query service..." -ForegroundColor Cyan
-Start-AgentWindow -Name "Audit Query (GraphQL+SQLite)" -NpmScript "agents:audit-query" -Port 5000
+Write-Host "Phase 3: Launching audit services..." -ForegroundColor Cyan
+Start-AgentWindow -Name "Audit Query (GraphQL+SQLite)" -NpmScript "agents:audit-query"     -Port 5000
+Start-AgentWindow -Name "Audit Reporting Agent"        -NpmScript "agents:audit-reporting" -Port 7074
 Write-Host ""
 
 Write-Host "============================================================" -ForegroundColor Green
-Write-Host "  All 7 agent windows have been spawned."                      -ForegroundColor Green
+Write-Host "  All 8 agent windows have been spawned."                      -ForegroundColor Green
 Write-Host ""
 Write-Host "  Verify with: " -NoNewline; Write-Host ".\check-agents.ps1"   -ForegroundColor Yellow
 Write-Host "  Stop all   : " -NoNewline; Write-Host ".\stop-all-agents.ps1" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  Health URLs:" -ForegroundColor Cyan
-Write-Host "    http://localhost:7070/health   (treasury)"  -ForegroundColor Gray
-Write-Host "    http://localhost:7071/health   (credit)"    -ForegroundColor Gray
-Write-Host "    http://localhost:7072/health   (inventory)" -ForegroundColor Gray
-Write-Host "    http://localhost:7073/health   (logistics)" -ForegroundColor Gray
+Write-Host "    http://localhost:7070/health   (treasury)"        -ForegroundColor Gray
+Write-Host "    http://localhost:7071/health   (credit)"          -ForegroundColor Gray
+Write-Host "    http://localhost:7072/health   (inventory)"       -ForegroundColor Gray
+Write-Host "    http://localhost:7073/health   (logistics)"       -ForegroundColor Gray
+Write-Host "    http://localhost:7074/health   (audit-reporting)" -ForegroundColor Gray
 Write-Host "    http://localhost:5000/graphql  (audit-query GraphQL UI)" -ForegroundColor Gray
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host ""
