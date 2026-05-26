@@ -1,5 +1,5 @@
 # ============================================================================
-# stop-all-agents.ps1 -- Stop all 6 agents by killing whoever owns their port
+# stop-all-agents.ps1 -- Stop all 8 agents by killing whoever owns their port
 # ============================================================================
 #
 # Finds the process holding each known agent port and stops it. This kills
@@ -12,13 +12,14 @@
 # ============================================================================
 
 $AgentPorts = @{
-    "buyer"       = 9090
-    "seller"      = 8080
-    "treasury"    = 7070
-    "credit"      = 7071
-    "inventory"   = 7072
-    "logistics"   = 7073
-    "audit-query" = 5000
+    "buyer"           = 9090
+    "seller"          = 8080
+    "treasury"        = 7070
+    "credit"          = 7071
+    "inventory"       = 7072
+    "logistics"       = 7073
+    "audit-reporting" = 7074
+    "audit-query"     = 5000
 }
 
 Write-Host ""
