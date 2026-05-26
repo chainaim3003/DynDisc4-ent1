@@ -12,12 +12,13 @@
 # ============================================================================
 
 $AgentPorts = @{
-    "buyer"     = 9090
-    "seller"    = 8080
-    "treasury"  = 7070
-    "credit"    = 7071
-    "inventory" = 7072
-    "logistics" = 7073
+    "buyer"       = 9090
+    "seller"      = 8080
+    "treasury"    = 7070
+    "credit"      = 7071
+    "inventory"   = 7072
+    "logistics"   = 7073
+    "audit-query" = 5000
 }
 
 Write-Host ""

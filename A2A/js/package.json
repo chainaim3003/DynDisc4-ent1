@@ -24,6 +24,7 @@
     "agents:credit": "npx tsx src/agents/credit-agent/index.ts",
     "agents:inventory": "npx tsx src/agents/inventory-agent/index.ts",
     "agents:logistics": "npx tsx src/agents/logistics-agent/index.ts",
+    "agents:audit-query": "npx tsx src/api/graphql/index.ts",
     "api:onboarding": "npx tsx src/api/onboarding-server.ts",
     "bootstrap:demo": "npx tsx scripts/bootstrap-demo-counterparties.ts",
     "replay:fixtures": "npx tsx scripts/replay-fixtures.ts",
