@@ -99,6 +99,24 @@ export function getIndexJsonlPath(): string {
 }
 
 /**
+ * Absolute path to the SQLite sidecar database (Audit Framework v6, Iter 6).
+ * The sidecar is a *derived* index built by reading `index.jsonl` line by
+ * line and inserting one row per audit into the `audits` table. The audit
+ * JSON files and `index.jsonl` remain the source of truth; the sidecar is a
+ * fast-query convenience that can be rebuilt at any time from `index.jsonl`
+ * alone (Strategy A, replay-from-zero — see DECISIONS.md iter-6 addendum
+ * Item 3).
+ *
+ * Resolves to: A2A/js/src/audits/audits.sqlite
+ *
+ * The file is gitignored (`A2A/js/.gitignore` → `src/audits/*.sqlite`)
+ * because it is regeneratable from source-controlled data.
+ */
+export function getAuditsSqlitePath(): string {
+  return path.join(getAuditsRoot(), "audits.sqlite");
+}
+
+/**
  * Absolute path to the reports root (used by Iteration 7's AuditReportingAgent).
  * Subfolders daily/, weekly/, on-demand/ are created here during Iteration 1
  * Phase 1 so downstream iterations can write into them without race conditions.

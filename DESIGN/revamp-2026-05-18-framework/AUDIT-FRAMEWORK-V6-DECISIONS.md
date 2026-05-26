@@ -852,6 +852,336 @@ addendum entry records the change with rationale.
   to validate selfCheck `ref` fields against the audit JSON. PowerShell-
   side detail; the JSON Pointers themselves are locked above.
 
+### 2026-05-25 — Notes addendum: Iter 6 vocabulary lock (SQLite sidecar + GraphQL + iter-5 hygiene)
+
+Iter 6 ships cross-deal queryability machinery on top of the iter-1
+through iter-5 audit content. No new audit *content* is added; the
+existing per-deal audit JSON files and `index.jsonl` remain the source
+of truth. Iter 6 adds (a) a SQLite sidecar populated from
+`index.jsonl`, (b) a localhost-only read-only GraphQL server on
+`:5000`, and (c) two iter-5 hygiene items folded into this iteration
+(Twilio Account SID scrubbing in audit notifications; one-time Gemini
+pricing verification).
+
+Nothing in this addendum changes the locked-value column for any prior
+Q. It supplies the field-level vocabulary, the SQLite schema, the
+resolver-split contract, and the iter-6-specific deferred markers.
+
+#### Item 0 — Core philosophy (carried forward verbatim from iter-4/5 Item 0)
+
+Honest partial > misleading complete. Missing by design ≠ missing by
+failure. The sidecar is a *derived* index over `index.jsonl`; if the
+sidecar disagrees with the source-of-truth audit JSON files, the JSON
+files win and the sidecar is rebuilt. Strategy A (Item 3) makes this
+honest by always being reproducible from `index.jsonl` alone.
+
+#### Item 1 — Iter 6 scope marker (cross-cutting)
+
+Iter 6 introduces no top-level audit-block keys, so no
+`<block>Scope` marker is added to the audit JSON. The sidecar database
+and the GraphQL endpoint are *external* to the audit JSON files. A
+reader inspecting any single audit JSON should see no iter-6-specific
+fields.
+
+#### Item 2 — SQLite sidecar: location, driver, schema
+
+Locked:
+
+- **Driver:** `better-sqlite3` (synchronous, embedded, file-backed).
+- **DB file path:** `A2A/js/src/audits/audits.sqlite` — resolved via a
+  new helper `getAuditsSqlitePath()` added to `shared/audit-paths.ts`.
+- **Gitignore:** `A2A/js/src/audits/*.sqlite` and
+  `A2A/js/src/audits/.sidecar-state.json` (the latter reserved for a
+  future Strategy B upgrade; not used by Strategy A in iter 6).
+- **Sidecar module path:** `A2A/js/src/shared/sqlite-sidecar.ts`.
+
+SQLite schema (column ordering matches `AuditIndexLine` field
+ordering in `shared/audit-index-schema.ts` so the mapping is
+mechanical):
+
+```sql
+CREATE TABLE IF NOT EXISTS audits (
+  schema_version              INTEGER NOT NULL,
+  negotiation_id              TEXT    NOT NULL,
+  perspective                 TEXT    NOT NULL CHECK (perspective IN ('BUYER','SELLER')),
+  audit_file                  TEXT    NOT NULL,
+  started_at                  TEXT    NOT NULL,
+  generated_at                TEXT    NOT NULL,
+  outcome                     TEXT    NOT NULL CHECK (outcome IN ('success','escalation')),
+  final_price                 REAL,
+  quantity                    INTEGER NOT NULL,
+  total_deal_value            REAL,
+  currency                    TEXT    NOT NULL,
+  rounds_used                 INTEGER NOT NULL,
+  max_rounds                  INTEGER NOT NULL,
+  self_lei                    TEXT,
+  self_entity_name            TEXT,
+  counterparty_lei            TEXT,
+  counterparty_entity_name    TEXT,
+  credential_mode             TEXT    NOT NULL CHECK (credential_mode IN ('plain','vlei')),
+  self_process_mode           TEXT,
+  seller_live_mode            TEXT,
+  closed                      INTEGER NOT NULL CHECK (closed IN (0,1)),
+  buyer_max                   REAL,
+  seller_min                  REAL,
+  zopa_feasible               INTEGER          CHECK (zopa_feasible   IS NULL OR zopa_feasible   IN (0,1)),
+  outside_zopa                INTEGER          CHECK (outside_zopa    IS NULL OR outside_zopa    IN (0,1)),
+  decision_count              INTEGER NOT NULL,
+  treasury_override_applied   INTEGER          CHECK (treasury_override_applied IS NULL OR treasury_override_applied IN (0,1)),
+  treasury_final_npv          REAL,
+  PRIMARY KEY (negotiation_id, perspective)
+);
+
+CREATE INDEX IF NOT EXISTS idx_audits_outcome_started ON audits (outcome, started_at);
+CREATE INDEX IF NOT EXISTS idx_audits_generated_at    ON audits (generated_at);
+CREATE INDEX IF NOT EXISTS idx_audits_credential_mode ON audits (credential_mode);
+```
+
+Column-name convention: `snake_case` SQL ↔ `camelCase` TS. The
+sidecar's TS-to-SQL transformation is a single mechanical mapping
+function `auditIndexLineToRow(line: AuditIndexLine): SqlRow`. Adding a
+field to `AuditIndexLine` in a future iteration requires bumping
+`schemaVersion` and migrating the SQLite table; the sidecar refuses to
+ingest a line whose `schemaVersion` exceeds what the current code knows.
+
+Boolean→INTEGER mapping: `false → 0`, `true → 1`, `undefined/null → NULL`.
+
+#### Item 3 — Sidecar restart strategy (locked: Strategy A, replay-from-zero)
+
+On sidecar startup:
+
+1. Open `audits.sqlite` (create if absent; ensure schema via the
+   `CREATE TABLE IF NOT EXISTS` above).
+2. `DELETE FROM audits` (truncate, idempotent reset).
+3. Stream-read `audits/index.jsonl` line by line; parse each line as
+   `AuditIndexLine`; `INSERT OR REPLACE` into `audits`.
+4. After replay completes, enter tail mode: poll `index.jsonl` for
+   appended bytes (or use `fs.watch`; implementation detail not locked
+   here) and `INSERT OR REPLACE` each new line as it arrives.
+
+Rationale: at the current scale (hundreds of audits) Strategy A
+completes a full rebuild in well under a second. Persisted-offset
+recovery (Strategy B) is the long-term answer but adds a recovery edge
+case (file truncation/rotation) and is not justified at iter-6 scale.
+The `.sidecar-state.json` filename is reserved for the Strategy B
+upgrade so the gitignore entry doesn't have to be added later.
+
+**Honest gap:** Strategy A means the sidecar cannot detect or report
+on lines that were *removed* from `index.jsonl` between runs — it
+trusts the file as the authoritative current state. This is consistent
+with the source-of-truth-wins principle in Item 0.
+
+#### Item 4 — Legacy file exclusion (locked)
+
+Files under `audits/_legacy_escalations/` are NOT ingested into
+`audits.sqlite`. They have no corresponding line in `index.jsonl` (they
+predate v6), so Strategy A simply doesn't see them — the exclusion is
+mechanical, not a filter. Iter-6 GraphQL queries return zero results
+for legacy deals. If cross-version queryability is wanted later, a
+separate `legacy_audits` table with a `schema_version = 'legacy'`
+marker is the canonical extension point; that work is out of scope
+here.
+
+#### Item 5 — GraphQL server: location, library, posture
+
+Locked:
+
+- **Library:** `graphql-yoga` (over Apollo/Mercurius for minimal
+  surface area and built-in HTTP server).
+- **Port:** `:5000` — verified free on the host 2026-05-25
+  (`netstat -ano | findstr :5000` returned only a UDP hit on `:50001`,
+  a substring false positive).
+- **Bind address:** `127.0.0.1` only. No external interfaces. Not
+  reachable from another host on the LAN.
+- **Auth:** None. Justified by localhost-only binding.
+- **Schema posture:** Read-only. No `Mutation` type defined in the
+  schema. Adding mutations later requires a new addendum.
+- **Module path:** `A2A/js/src/api/graphql/` (folder), with `index.ts`
+  as the server entry point, `schema.ts` for SDL, and `resolvers.ts`
+  for the resolver map.
+
+#### Item 6 — Resolver split contract (SQLite-backed vs JSON-on-demand)
+
+Locked split:
+
+| GraphQL field family | Backing | Rationale |
+|---|---|---|
+| All 28 `AuditIndexLine` fields exposed as scalars | SQLite (single-row select on PK or filtered scan) | Fast cross-deal scans, filter-eligible |
+| Filter args on `audits(...)` query (e.g. `outcome`, `credentialMode`, `startedAfter`, `startedBefore`, `negotiationId`, `perspective`, `closed`) | SQLite WHERE clause | Same |
+| Pagination on `audits(...)` | SQLite `LIMIT`/`OFFSET` | Item 7 |
+| `decisions`, `thinkCycleTrace`, `delegationChain`, `messageLog`, `intent`, `autonomy`, `identityProof`, `messageSigningPosture`, `agentSelf`, `agentCounterparty`, `frameworkMetrics`, `selfCheck`, `compliance`, `outcomeQuality` | JSON-on-demand: read the file at `auditFile` path, return the nested subtree | Nested arrays/objects not in SQLite by design (would 6× the storage and break the flat-index principle in `audit-index-schema.ts`) |
+
+When a JSON-on-demand resolver is invoked for a row whose `auditFile`
+is missing or unreadable, the resolver returns `null` and logs an
+operator warning (parallel to the `appendAuditIndexLine` error-path
+philosophy in `index-jsonl-writer.ts` — degrade, don't crash).
+
+#### Item 7 — GraphQL pagination (locked: offset, default 50, max 500)
+
+Pagination args on `audits(...)`:
+
+```graphql
+audits(
+  # filters
+  outcome:        Outcome,         # "success" | "escalation"
+  credentialMode: CredentialMode,  # "plain" | "vlei"
+  perspective:    Perspective,     # "BUYER" | "SELLER"
+  closed:         Boolean,
+  negotiationId:  String,
+  startedAfter:   String,          # ISO 8601 UTC
+  startedBefore:  String,
+  # pagination
+  limit:  Int = 50,                # default 50
+  offset: Int = 0
+): AuditConnection!
+```
+
+A `limit` greater than `500` is server-clamped to `500` and a
+non-error `warnings: ["limit_clamped"]` field on the response is
+emitted (a `warnings: [String!]!` field on `AuditConnection` is part
+of the schema). Negative `limit` or `offset` returns a GraphQL error.
+
+Rationale: cursor-based pagination is the long-term answer for unstable
+ordering under concurrent writes; at iter-6 scale (audits written at
+most a few per minute, queries typically reading hundreds), offset is
+sufficient and avoids the cursor-encoding complexity. A cursor mode
+can be added later as `after: String` without removing offset (both
+can coexist).
+
+#### Item 8 — Twilio Account SID scrubbing (locked into iter-6 scope)
+
+Iter 6 adds a small redactor to scrub Twilio Account SIDs from
+`notifications[].error` fields before audit JSON is written to disk.
+Motivation: v1.0.6 push to main was rejected once because audit JSONs
+contained provider-identifying patterns matching SIDs from failed
+WhatsApp deliveries (DECISIONS.md Erratum E5).
+
+Locked:
+
+- **Module path:** `A2A/js/src/shared/notification-redactor.ts`.
+- **Wire point:** invoked by `shared/audit-writer.ts` and `shared/logger.ts`
+  just before `JSON.stringify(audit)` writes to disk — specifically
+  over the `notifications[]` subtree. The redactor is a pure function
+  `redactNotifications(notifications: any[]): any[]` returning a new
+  array; the input is not mutated.
+- **Scope of patterns (iter 6):** `AC[a-f0-9]{32}` only — the Twilio
+  Account SID format that caused the push block. Other Twilio
+  identifier formats (`SK`, `SM`, `CH`, `IS`, etc.) are NOT in scope
+  for iter 6; if a similar block recurs from one of those, an iter-7
+  addendum adds them. Locking minimal scope keeps the redactor's false-
+  positive surface small.
+- **Replacement string:** `AC[REDACTED]` (preserves the `AC` prefix so
+  readers know what was redacted; drops the 32-hex-char tail).
+- **Behavior on absence:** if no `notifications[]` array exists, or if
+  no entry contains a matching pattern in any string field, the
+  function returns the input unchanged (identity).
+- **Honest gap:** redaction is applied to `.error` string values and
+  any other string field encountered inside a `notifications[]` entry
+  via a shallow scan. It does NOT recurse into nested objects (no
+  current notification schema needs it). Future deeper schemas
+  require expanded recursion + an addendum entry.
+
+Acceptance test (added to `Test-AuditV6-Iter6.ps1`): after generating
+a fresh deal with a simulated Twilio failure injected, the resulting
+audit JSON (read with `Get-Content -Raw -Encoding UTF8`) must contain
+zero matches for the regex `AC[a-f0-9]{32}` at any path. The test
+passes when match count is 0.
+
+**Amendment 2026-05-26 (Item 8 wiring-location correction):** The
+original "Wire point" bullet above said the redactor is invoked from
+`shared/audit-writer.ts` and `shared/logger.ts` just before
+`JSON.stringify(audit)` writes to disk. This was incorrect. Verification
+against the actual code on 2026-05-26 confirmed: the `NegotiationAudit`
+type in `shared/negotiation-types.ts` does not declare a `notifications`
+field; `audit-writer.ts` and `logger.ts` build audit objects that contain
+no `notifications` key. The on-disk `notifications[]` array is written
+exclusively by `src/notify/audit-attach.ts`, which reads the audit JSON
+back **after** `logger.saveAuditJson()` writes it, merges drained router
+delivery receipts, and re-writes the file. The redactor therefore wires
+into `audit-attach.ts` (one-line change: replace
+`audit.notifications = merged;` with
+`audit.notifications = redactNotifications(merged);`, plus the import).
+This is the actual `JSON.stringify(audit, null, 2)` call that persists
+SIDs to disk. The redactor module path
+(`shared/notification-redactor.ts`), function signature
+(`redactNotifications(notifications: any[]): any[]`), pattern
+(`AC[a-f0-9]{32}`), and replacement marker (`AC[REDACTED]`) remain as
+specified in the original Item 8.
+
+#### Item 9 — Gemini pricing verification (deferred Step F result)
+
+A one-time verification of the `GEMINI_PRICING` table in
+`shared/llm-client.ts` against
+`https://ai.google.dev/gemini-api/docs/pricing` was performed
+2026-05-25 against the page last updated 2026-05-19 UTC.
+
+Result: for the three models the table covers (`gemini-2.5-pro`,
+`gemini-2.5-flash`, `gemini-2.5-flash-lite`), the current values
+match the official Standard-tier, Paid, text-only, ≤200k-input-token
+pricing exactly:
+
+| Model                  | `in` $/1M | `out` $/1M | Verified |
+|------------------------|-----------|------------|----------|
+| `gemini-2.5-pro`       | 1.25      | 10.00      | ✓        |
+| `gemini-2.5-flash`     | 0.30      | 2.50       | ✓        |
+| `gemini-2.5-flash-lite`| 0.10      | 0.40       | ✓        |
+
+No patch to `shared/llm-client.ts` or `Test-AuditV6-Iter5.ps1` is
+required. No `v1.0.6.1` re-tag. The verification date and source URL
+are recorded in this addendum as the audit trail for "Step F closed."
+
+**Two honest gaps locked here for future awareness:**
+
+1. **>200k-token tiered pricing on `gemini-2.5-pro` is not modeled.**
+   Official high tier: `$2.50 in / $15.00 out`. Current flat-rate
+   would underestimate by ~2× input / ~1.5× output if a single
+   prompt crosses 200k input tokens. Current negotiation prompts are
+   typically <10k tokens; not an active mis-calculation. A future
+   iteration that allows large-context prompts must extend
+   `GEMINI_PRICING` to model the tier boundary and update the
+   `estimateCostUSD` function accordingly.
+
+2. **Audio-modality input pricing for Flash and Flash-Lite is not
+   modeled.** Official: Flash audio in `$1.00`, Flash-Lite audio in
+   `$0.30` (vs the text rates above). Codebase sends text-only
+   prompts to Gemini, so the current text-rate is correct for actual
+   usage. Future audio integration triggers a table update and an
+   addendum entry.
+
+#### Item 10 — What this addendum does NOT change
+
+- Any prior Q locked value — unchanged.
+- The `AuditIndexLine` schema in `shared/audit-index-schema.ts` —
+  unchanged. The SQLite columns mirror it; if either side needs to
+  change, both move together under a new addendum.
+- The on-disk per-deal audit JSON shape — unchanged. Iter 6 is purely
+  a read-side derivation layer over what iter-1 through iter-5
+  already write.
+- The `appendAuditIndexLine` write-side behavior in
+  `shared/index-jsonl-writer.ts` — unchanged. The sidecar is a *reader*
+  of `index.jsonl`, never a writer.
+- The `GEMINI_PRICING` table in `shared/llm-client.ts` — verified
+  unchanged per Item 9.
+
+#### What's deferred to the iter-6 code-edit phase (not locked here)
+
+- The exact tail-mode mechanism (`fs.watch` vs polling vs `chokidar`)
+  inside the sidecar. Implementation choice; Strategy A (Item 3)'s
+  full-rebuild-on-start makes any tail mechanism interchangeable.
+- The exact `graphql-yoga` package version. Pin to whatever resolves
+  on `npm install` at code-edit time; record in `package.json`.
+- The startup ordering between the seller-agent / buyer-agent and the
+  sidecar + GraphQL server. Default intent: sidecar + GraphQL run in
+  their own process or as a side-thread within an existing agent,
+  decided at code-edit time after reading
+  `A2A/js/run-all-agents.ps1`.
+- Whether the sidecar runs in the seller-agent process, buyer-agent
+  process, or a new standalone process. Default intent: standalone
+  process for clean separation; can collapse later.
+- The exact GraphQL schema SDL string and resolver function bodies.
+  Items 5/6/7 lock the contract; the SDL is mechanical from the
+  contract.
+
 ---
 
 **End of decisions reference.**

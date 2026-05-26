@@ -1,5 +1,5 @@
 # ============================================================================
-# run-all-agents.ps1 — Launch all 6 agents in separate PowerShell windows
+# run-all-agents.ps1 — Launch all 7 agents in separate PowerShell windows
 # ============================================================================
 #
 # Each agent runs in its own PowerShell window so you can see live console
@@ -39,7 +39,7 @@ if (-not (Test-Path (Join-Path $JsRoot "package.json"))) {
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Launching all 6 agents (each in its own PowerShell window)"  -ForegroundColor Cyan
+Write-Host "  Launching all 7 agents (each in its own PowerShell window)"  -ForegroundColor Cyan
 Write-Host "  Working directory: $JsRoot"                                   -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -112,8 +112,15 @@ Start-Sleep -Seconds 2
 Start-AgentWindow -Name "Tommy Buyer Agent"    -NpmScript "agents:buyer"  -Port 9090
 Write-Host ""
 
+# ----------------------------------------------------------------------------
+# Phase 3: audit query service (Iter 6 — standalone GraphQL + SQLite sidecar)
+# ----------------------------------------------------------------------------
+Write-Host "Phase 3: Launching audit query service..." -ForegroundColor Cyan
+Start-AgentWindow -Name "Audit Query (GraphQL+SQLite)" -NpmScript "agents:audit-query" -Port 5000
+Write-Host ""
+
 Write-Host "============================================================" -ForegroundColor Green
-Write-Host "  All 6 agent windows have been spawned."                      -ForegroundColor Green
+Write-Host "  All 7 agent windows have been spawned."                      -ForegroundColor Green
 Write-Host ""
 Write-Host "  Verify with: " -NoNewline; Write-Host ".\check-agents.ps1"   -ForegroundColor Yellow
 Write-Host "  Stop all   : " -NoNewline; Write-Host ".\stop-all-agents.ps1" -ForegroundColor Yellow
@@ -123,5 +130,6 @@ Write-Host "    http://localhost:7070/health   (treasury)"  -ForegroundColor Gra
 Write-Host "    http://localhost:7071/health   (credit)"    -ForegroundColor Gray
 Write-Host "    http://localhost:7072/health   (inventory)" -ForegroundColor Gray
 Write-Host "    http://localhost:7073/health   (logistics)" -ForegroundColor Gray
+Write-Host "    http://localhost:5000/graphql  (audit-query GraphQL UI)" -ForegroundColor Gray
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host ""

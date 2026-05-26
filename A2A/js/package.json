@@ -8,6 +8,7 @@
     "packages/*"
   ],
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.13.14",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
@@ -23,6 +24,7 @@
     "agents:credit": "npx tsx src/agents/credit-agent/index.ts",
     "agents:inventory": "npx tsx src/agents/inventory-agent/index.ts",
     "agents:logistics": "npx tsx src/agents/logistics-agent/index.ts",
+    "agents:audit-query": "npx tsx src/api/graphql/index.ts",
     "api:onboarding": "npx tsx src/api/onboarding-server.ts",
     "bootstrap:demo": "npx tsx scripts/bootstrap-demo-counterparties.ts",
     "replay:fixtures": "npx tsx scripts/replay-fixtures.ts",
@@ -35,10 +37,13 @@
     "@types/express": "^5.0.1",
     "@types/pdfkit": "^0.13.4",
     "algosdk": "^3.5.2",
+    "better-sqlite3": "^12.0.0",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "graphql": "^16.8.0",
+    "graphql-yoga": "^5.0.0",
     "pdfkit": "^0.15.0",
     "uuid": "^11.0.3"
   },

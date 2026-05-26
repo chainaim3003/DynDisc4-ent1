@@ -26,3 +26,6 @@
 # ----------------------------------------------------------------------------
 **/.env
 **/.env*.local
+
+A2A/js/src/audits/audits.sqlite-shm
+A2A/js/src/audits/audits.sqlite-wal
