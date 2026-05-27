@@ -225,7 +225,7 @@ if ($agentExists) {
 
     Check "cron daily schedule '0 21 * * *'"           ($agentText -match "CRON_DAILY\s*=\s*[`"']0\s+21\s+\*\s+\*\s+\*[`"']")
     Check "cron weekly schedule '0 21 * * 0'"          ($agentText -match "CRON_WEEKLY\s*=\s*[`"']0\s+21\s+\*\s+\*\s+0[`"']")
-    Check "cron timezone is UTC"                       ($agentText -match "timezone:\s*[`"']UTC[`"']")
+    Check "cron timezone is UTC"                       ((($agentText -match "timezone:\s*[`"']UTC[`"']") -or ($agentText -match "timezone:\s*CRON_TIMEZONE")) -and ($agentText -match "CRON_TIMEZONE\s*=\s*[`"']UTC[`"']"))
 
     Check "authority role = Chief Audit Officer"       ($agentText -match "Chief Audit Officer")
     Check "credentialMode is 'plain' (Q27)"            ($agentText -match "credentialMode:\s*[`"']plain[`"']")

@@ -159,14 +159,18 @@ function cacheSet(key: string, payload: any): void {
 /**
  * Read all index.jsonl lines. Returns [] if the file is missing.
  * Malformed lines are skipped (with a warn to stderr) rather than crashing.
+ * BOM-tolerant: strips UTF-8 BOM from file start and from any individual line.
  */
 function readIndexLines(): AuditIndexLine[] {
     const file = getIndexJsonlPath();
     if (!fs.existsSync(file)) return [];
-    const raw = fs.readFileSync(file, "utf8");
+    let raw = fs.readFileSync(file, "utf8");
+    if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
     const out: AuditIndexLine[] = [];
     for (const line of raw.split(/\r?\n/)) {
-        const trimmed = line.trim();
+        let trimmed = line.trim();
+        if (!trimmed) continue;
+        if (trimmed.charCodeAt(0) === 0xFEFF) trimmed = trimmed.slice(1).trim();
         if (!trimmed) continue;
         try {
             out.push(JSON.parse(trimmed) as AuditIndexLine);
@@ -175,6 +179,18 @@ function readIndexLines(): AuditIndexLine[] {
         }
     }
     return out;
+}
+
+/**
+ * BOM-tolerant JSON file reader. Some older audit.json files were written
+ * with a UTF-8 BOM at file start (legacy writer bug, since fixed in newer
+ * writes). JSON.parse rejects BOM, so we strip it here defensively. This is
+ * safe for clean files too — the check is a single charCodeAt.
+ */
+function parseJsonFile(filePath: string): any {
+    let raw = fs.readFileSync(filePath, "utf8");
+    if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+    return JSON.parse(raw);
 }
 
 /**
@@ -216,6 +232,43 @@ function isoWeekKey(d: Date): string {
     const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
     const weekNo = Math.ceil((((tmp.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
     return `${tmp.getUTCFullYear()}-${weekNo.toString().padStart(2, "0")}`;
+}
+
+/**
+ * Human-readable monthly-week key — "YYYY-Mon-WeekN".
+ *
+ * Definition (unambiguous, no month overlap):
+ *   - The week is labeled by the calendar month of its MONDAY (UTC).
+ *   - Within that month, weeks are numbered 1, 2, 3, ... by the count of
+ *     Mondays from the start of the month up to and including this week's
+ *     Monday.
+ *
+ * Examples (UTC):
+ *   Mon May  4 2026 → "2026-May-Week2"  (2nd Monday of May)
+ *   Mon May 25 2026 → "2026-May-Week4"  (4th Monday of May)
+ *   Mon Jun  1 2026 → "2026-Jun-Week1"  (1st Monday of June)
+ *
+ * Input convention: `d` is interpreted as the Monday of the week to label.
+ * In this file, callers always pass `new Date(since)` where `since` is the
+ * UTC midnight of the week-start Monday — so the input contract is satisfied
+ * by construction. The helper does NOT shift `d` to find the Monday itself;
+ * it just reads `d`'s UTC year / month / day-of-month directly.
+ */
+function monthlyWeekKey(d: Date): string {
+    const monthAbbrev = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const year      = d.getUTCFullYear();
+    const monthIdx  = d.getUTCMonth();          // 0..11
+    const monthName = monthAbbrev[monthIdx];
+    const dayOfMonth = d.getUTCDate();          // 1..31
+
+    // Nth Monday of the month = ceil(dayOfMonth / 7) when d itself is a
+    // Monday. (e.g. May 4 → 1; May 11 → 2; May 18 → 3; May 25 → 4.)
+    const weekNoInMonth = Math.ceil(dayOfMonth / 7);
+
+    return `${year}-${monthName}-Week${weekNoInMonth}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -348,7 +401,7 @@ function buildWeeklyContext(weekStartUtc: string): WeeklyReportContext {
     const weekEndDate = new Date(since + 6 * 24 * 60 * 60 * 1000);
 
     return {
-        weekKey:           isoWeekKey(new Date(since)),
+        weekKey:           monthlyWeekKey(new Date(since)),
         weekStartUtc,
         weekEndUtc:        formatYmdUtc(weekEndDate),
         generatedAtUtc:    new Date().toISOString(),
@@ -389,18 +442,18 @@ function loadDealAudits(negotiationId: string): ForensicLoadResult | null {
         if (!fs.existsSync(sellerPath)) return null;
         return {
             auditFile:   sellerPath,
-            audit:       JSON.parse(fs.readFileSync(sellerPath, "utf8")),
+            audit:       parseJsonFile(sellerPath),
             sellerAudit: null,
         };
     }
     const buyerPath = path.join(getAuditsRoot(), buyerLine.auditFile);
     if (!fs.existsSync(buyerPath)) return null;
-    const buyerJson = JSON.parse(fs.readFileSync(buyerPath, "utf8"));
+    const buyerJson = parseJsonFile(buyerPath);
     let sellerJson: any = null;
     if (sellerLine) {
         const sellerPath = path.join(getAuditsRoot(), sellerLine.auditFile);
         if (fs.existsSync(sellerPath)) {
-            try { sellerJson = JSON.parse(fs.readFileSync(sellerPath, "utf8")); }
+            try { sellerJson = parseJsonFile(sellerPath); }
             catch { sellerJson = null; }
         }
     }
@@ -701,6 +754,56 @@ function buildApp(): express.Express {
         });
     });
 
+    // List deals that have v6 forensic audit JSON available (UI dropdown source).
+    // Reads index.jsonl + verifies the underlying audit file actually exists on
+    // disk, so every deal returned here is guaranteed to produce a real PDF —
+    // no 404s, no half-rendered "(not available)" sections. Dedupes BUYER+SELLER
+    // index lines into one row per negotiationId (prefers BUYER when both exist).
+    app.get("/api/reports/forensic/available-deals", (_req: Request, res: Response) => {
+        const lines = readIndexLines();
+        const root  = getAuditsRoot();
+
+        // Group by negotiationId — prefer BUYER perspective if both exist
+        const byId = new Map<string, AuditIndexLine>();
+        for (const line of lines) {
+            const existing = byId.get(line.negotiationId);
+            if (!existing) {
+                byId.set(line.negotiationId, line);
+            } else if (existing.perspective === "SELLER" && line.perspective === "BUYER") {
+                byId.set(line.negotiationId, line);
+            }
+        }
+
+        // Only include deals whose audit file actually exists on disk —
+        // a stale index.jsonl entry without a backing file would 404 the PDF.
+        const deals: Array<{
+            negotiationId:          string;
+            outcome:                "success" | "escalation";
+            generatedAt:            string;
+            totalDealValue:         number | null;
+            currency:               string;
+            counterpartyEntityName: string | null;
+        }> = [];
+
+        for (const line of byId.values()) {
+            const auditPath = path.join(root, line.auditFile);
+            if (!fs.existsSync(auditPath)) continue;
+            deals.push({
+                negotiationId:          line.negotiationId,
+                outcome:                line.outcome,
+                generatedAt:            line.generatedAt,
+                totalDealValue:         line.totalDealValue,
+                currency:               line.currency,
+                counterpartyEntityName: line.counterpartyEntityName ?? null,
+            });
+        }
+
+        // Sort newest first so the most recent demo deal sits at the top
+        deals.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
+
+        res.json({ deals, count: deals.length });
+    });
+
     // Fetch a single report's markdown content
     app.get("/api/reports/content", (req: Request, res: Response) => {
         const kind = String(req.query.kind ?? "");
@@ -861,6 +964,7 @@ async function main() {
         console.log(`    GET  /health`);
         console.log(`    GET  /api/authority`);
         console.log(`    GET  /api/reports/list`);
+        console.log(`    GET  /api/reports/forensic/available-deals`);
         console.log(`    GET  /api/reports/content?kind=daily|weekly|on-demand&name=<file>.md`);
         console.log(`    POST /api/reports/daily      { dateUtc?: "YYYY-MM-DD" }`);
         console.log(`    POST /api/reports/weekly     { weekStartUtc?: "YYYY-MM-DD" }`);

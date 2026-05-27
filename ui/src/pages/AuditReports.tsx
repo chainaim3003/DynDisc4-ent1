@@ -3,7 +3,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { fetchFilteredDeals, type DealSummary } from "@/lib/dealQualityApi";
 import {
   FileText,
   RefreshCw,
@@ -59,6 +58,28 @@ interface GenerateResponse {
 }
 
 // ─── API calls ───────────────────────────────────────────────────────────
+
+/**
+ * One entry from /api/reports/forensic/available-deals — deals that actually
+ * have a v6 forensic audit JSON on disk. The forensic PDF endpoint is
+ * guaranteed to succeed for every deal in this list (no 404s, no missing
+ * audit blocks).
+ */
+interface AvailableDeal {
+  negotiationId:          string;
+  outcome:                "success" | "escalation";
+  generatedAt:            string;
+  totalDealValue:         number | null;
+  currency:               string;
+  counterpartyEntityName: string | null;
+}
+
+async function fetchAvailableDeals(): Promise<AvailableDeal[]> {
+  const res = await fetch(`${REPORTING_URL}/api/reports/forensic/available-deals`);
+  if (!res.ok) throw new Error(`available-deals ${res.status}`);
+  const data = await res.json();
+  return (data?.deals ?? []) as AvailableDeal[];
+}
 
 async function fetchReports(): Promise<ReportListResponse> {
   const res = await fetch(`${REPORTING_URL}/api/reports/list`);
@@ -203,10 +224,13 @@ export function AuditReports() {
     refetchInterval: 10_000,
   });
 
-  // Reuse the buyer-side deal list for the forensic picker
+  // Only list deals that have a v6 forensic audit available on disk.
+  // The new endpoint reads index.jsonl + verifies the audit file exists, so
+  // every option in the dropdown is guaranteed to produce a real PDF —
+  // no more 404s for legacy deals that lack v6 audit blocks.
   const dealsQuery = useQuery({
-    queryKey: ["recent-deals-for-forensic"],
-    queryFn:  () => fetchFilteredDeals({ limit: 100 }),
+    queryKey: ["forensic-available-deals"],
+    queryFn:  fetchAvailableDeals,
   });
 
   const [viewerOpen, setViewerOpen] = useState<{ kind: "daily" | "weekly" | "on-demand"; name: string } | null>(null);
@@ -356,7 +380,8 @@ export function AuditReports() {
         </h3>
         <p className="text-xs text-muted-foreground">
           Renders a regulator-grade PDF of one negotiation with all 14 v6 audit blocks.
-          Pick a deal or paste a NEG-… ID.
+          Only deals with a v6 forensic audit available on disk are listed — every
+          option here produces a real PDF.
         </p>
         <div className="flex flex-col sm:flex-row gap-2">
           <select
@@ -364,12 +389,21 @@ export function AuditReports() {
             value={forensicId}
             onChange={(e) => setForensicId(e.target.value)}
           >
-            <option value="">— pick a deal —</option>
-            {(dealsQuery.data ?? []).map((d: DealSummary) => (
-              <option key={d.negotiationId} value={d.negotiationId}>
-                {d.negotiationId} ({d.outcome})
-              </option>
-            ))}
+            <option value="">
+              — pick a deal ({(dealsQuery.data ?? []).length} available) —
+            </option>
+            {(dealsQuery.data ?? []).map((d: AvailableDeal) => {
+              const sym = d.currency === "USD" ? "$" : d.currency === "INR" ? "₹" : "";
+              const valueLabel = d.totalDealValue != null
+                ? ` · ${sym}${d.totalDealValue.toLocaleString()}`
+                : "";
+              const dateLabel = ` · ${d.generatedAt.slice(0, 10)}`;
+              return (
+                <option key={d.negotiationId} value={d.negotiationId}>
+                  {d.negotiationId} ({d.outcome}{valueLabel}{dateLabel})
+                </option>
+              );
+            })}
           </select>
           <Input
             placeholder="…or paste NEG-1779515273352"
