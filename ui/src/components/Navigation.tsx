@@ -9,12 +9,14 @@ import {
   Scale,
   FileBarChart,
   Settings as SettingsIcon,
+  Clapperboard,
 } from 'lucide-react';
 import { ThemeToggle } from './ThemeToggle';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/agents', icon: Bot, label: 'Agents' },
+  { to: '/agents-2', icon: Clapperboard, label: 'Theater' },
   { to: '/contracts', icon: FileText, label: 'Treasury Management' },
   { to: '/risk', icon: BarChart3, label: 'Risk & Analytics' },
   { to: '/deal-quality', icon: Scale, label: 'Deal Quality' },
