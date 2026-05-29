@@ -23,9 +23,15 @@ import { createServer } from "http";
 import { startSidecar, type SidecarHandle } from "../../shared/sqlite-sidecar.js";
 import { typeDefs } from "./schema.js";
 import { buildResolvers } from "./resolvers.js";
+import dotenv from "dotenv";
 
-const HOST = "127.0.0.1";
-const PORT = 5000;
+// Load the shared A2A/js/.env (same convention as onboarding-server.ts).
+dotenv.config();
+
+// HOST/PORT read from env (AUDIT_QUERY_HOST / AUDIT_QUERY_PORT in A2A/js/.env);
+// the literals are fallback defaults that preserve the previous behavior.
+const HOST = process.env.AUDIT_QUERY_HOST ?? "127.0.0.1";
+const PORT = Number(process.env.AUDIT_QUERY_PORT ?? 5000);
 
 async function main() {
   // 1. Start the sidecar (open + WAL + schema + replay + tail).

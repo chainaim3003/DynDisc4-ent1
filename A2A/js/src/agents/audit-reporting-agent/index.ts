@@ -70,14 +70,20 @@ import {
 } from "../../shared/audit-paths.js";
 import type { AuditIndexLine } from "../../shared/audit-index-schema.js";
 import { generateAuditPdf } from "../../shared/audit-pdf.js";
+import dotenv from "dotenv";
 
 // ── Resolve __dirname for ESM ────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
+// Load this agent's own .env (same pattern as the other sub-agents).
+dotenv.config({ path: path.join(__dirname, ".env") });
+
 // ── Constants (mirror the locked decisions) ──────────────────────────────
-const HOST            = "127.0.0.1";
-const PORT            = 7074;                     // Q24
+// HOST/PORT now read from env (see .env in this folder). The literals below
+// are fallback defaults that preserve the previous hardcoded behavior.
+const HOST            = process.env.HOST ?? "127.0.0.1";
+const PORT            = Number(process.env.PORT ?? 7074);  // Q24 (override via .env)
 const CRON_DAILY      = "0 21 * * *";             // Q25 — daily 21:00 UTC
 const CRON_WEEKLY     = "0 21 * * 0";             // Q25 — Sunday 21:00 UTC
 const CRON_TIMEZONE   = "UTC";                    // Item 14
